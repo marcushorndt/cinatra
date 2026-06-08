@@ -1,0 +1,42 @@
+{
+  "_comment": [
+    "Release-tag protection RULESET for this repository. A `v*` tag triggers a",
+    "production deploy (build-image.yml dispatches to the deploy pipeline), so",
+    "creating one MUST be restricted to maintainers. Branch protection cannot",
+    "cover tags, so this is a separate ruleset (not part of branch-protections.json).",
+    "",
+    "Apply (the jq filter drops this `_comment`, which the rulesets API rejects):",
+    "  gh api -X POST repos/cinatra-ai/cinatra/rulesets \\",
+    "    --input <(jq 'del(._comment)' .github/tag-protections.json)",
+    "",
+    "Bypass is the repository Admin role (actor_id 5 — empirically the only base",
+    "role id confirmed against this org; org owners hold admin on every org repo,",
+    "so the owner who cuts v0.1.0 is covered). Non-numeric base-role ids (write /",
+    "maintain) are intentionally NOT used here: their ids are easy to get wrong and",
+    "a wrong id could let a plain write collaborator cut a prod-deploying tag.",
+    "",
+    "To let non-admin MAINTAINERS cut releases, create an `@cinatra-ai/maintainers`",
+    "team and append it (Team ids are unambiguous):",
+    "  { \"actor_id\": <id from: gh api orgs/cinatra-ai/teams/maintainers --jq .id>,",
+    "    \"actor_type\": \"Team\", \"bypass_mode\": \"always\" }",
+    "",
+    "Rules: `creation` lets only bypass actors create `v*` tags; `deletion` +",
+    "`non_fast_forward` block deletion and force-moving a release tag for everyone",
+    "EXCEPT the admin bypass (admins can still correct a botched tag). For strict",
+    "immutability that binds admins too, split into a second no-bypass ruleset."
+  ],
+  "name": "Release tag protection (v*)",
+  "target": "tag",
+  "enforcement": "active",
+  "bypass_actors": [
+    { "actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "always" }
+  ],
+  "conditions": {
+    "ref_name": { "include": ["refs/tags/v*"], "exclude": [] }
+  },
+  "rules": [
+    { "type": "creation" },
+    { "type": "deletion" },
+    { "type": "non_fast_forward" }
+  ]
+}
