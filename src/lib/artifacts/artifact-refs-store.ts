@@ -52,7 +52,15 @@ export type ArtifactRefInput = {
 };
 
 const conn = (): string => db().getPostgresConnectionString();
-const q = (): string => db().postgresSchema.replaceAll('"', '""');
+// `postgresSchema` is a pure env read (mirrors database.ts:36). Derive it
+// LOCALLY rather than through db(): database.ts is re-evaluated per-route under
+// Turbopack (it persists state on globalThis precisely for that reason), so a
+// cross-module `require("@/lib/database").postgresSchema` can resolve a
+// different / mid-eval instance whose `const` reads back `undefined` — which
+// 500s chat save (buildArtifactRefSyncQueries → q() → undefined.replaceAll).
+// Env is instance-independent, so this is identical and cycle-proof.
+const q = (): string =>
+  (process.env.SUPABASE_SCHEMA?.trim() || "cinatra").replaceAll('"', '""');
 
 /** Idempotent batch insert of artifact refs (one row per ref). The
  *  unique index on (org_id, artifact_id, representation_revision_id,
