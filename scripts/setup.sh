@@ -47,7 +47,8 @@ info "Prerequisites OK."
 #  4. Default to dev (non-interactive shells without an env override)
 
 normalize_mode() {
-  case "${1,,}" in
+  # Lowercase via tr (not bash 4 `${1,,}`) so this runs on stock macOS bash 3.2.
+  case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
     d|dev|development) echo "development" ;;
     p|prod|production) echo "production" ;;
     *) echo "" ;;
@@ -86,11 +87,17 @@ if [ ! -f .env.local ]; then
 
   # Generate a random auth secret.
   SECRET=$(openssl rand -hex 32 2>/dev/null || head -c 64 /dev/urandom | xxd -p -c 64 | head -1)
+  # Replace by KEY, not by placeholder text: .env.example ships an empty
+  # `BETTER_AUTH_SECRET=` line (no placeholder), so the old
+  # `s/replace-with-a-random-32-byte-hex-secret/.../` substitution was a no-op
+  # and left the secret blank — `setup:dev` then aborts with "Missing
+  # BETTER_AUTH_SECRET". Anchoring on the key works whether the value is empty
+  # or a placeholder.
   if [ "$(uname)" = "Darwin" ]; then
-    sed -i '' "s/replace-with-a-random-32-byte-hex-secret/$SECRET/" .env.local
+    sed -i '' "s|^BETTER_AUTH_SECRET=.*|BETTER_AUTH_SECRET=$SECRET|" .env.local
     sed -i '' "s/^CINATRA_RUNTIME_MODE=.*/CINATRA_RUNTIME_MODE=$RESOLVED_MODE/" .env.local
   else
-    sed -i "s/replace-with-a-random-32-byte-hex-secret/$SECRET/" .env.local
+    sed -i "s|^BETTER_AUTH_SECRET=.*|BETTER_AUTH_SECRET=$SECRET|" .env.local
     sed -i "s/^CINATRA_RUNTIME_MODE=.*/CINATRA_RUNTIME_MODE=$RESOLVED_MODE/" .env.local
   fi
   info ".env.local created with a random BETTER_AUTH_SECRET and CINATRA_RUNTIME_MODE=$RESOLVED_MODE."
@@ -181,7 +188,7 @@ fi
 LOAD_SEED=0
 
 if [ -n "${SEED:-}" ]; then
-  case "${SEED,,}" in
+  case "$(printf '%s' "$SEED" | tr '[:upper:]' '[:lower:]')" in
     1|y|yes|true) LOAD_SEED=1 ;;
     0|n|no|false) LOAD_SEED=0 ;;
     *) error "SEED='$SEED' is not valid. Use 1 or 0." ;;
@@ -191,7 +198,7 @@ elif [ "${YES:-}" = "1" ]; then
 elif [ -t 0 ]; then
   prompt "Load sample fixture data (ACME Group) for testing? [y/N]: "
   read -r SEED_ANSWER
-  case "${SEED_ANSWER,,}" in
+  case "$(printf '%s' "$SEED_ANSWER" | tr '[:upper:]' '[:lower:]')" in
     y|yes) LOAD_SEED=1 ;;
     *)     LOAD_SEED=0 ;;
   esac
