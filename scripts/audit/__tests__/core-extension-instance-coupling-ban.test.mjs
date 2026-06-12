@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import {
   scanInstanceCoupling,
@@ -11,9 +11,11 @@ import {
   baselineGrowth,
   growthAllowance,
   maskAllowlistedIds,
+  allowlistShapeDefects,
   discoverExtensionNames,
   SCANNER_EPOCH,
 } from "../core-extension-instance-coupling-ban.mjs";
+import { DATA_CONTRACT_ID_ALLOWLIST } from "../lib/extension-reference-classification.mjs";
 import { GENERATED_MANIFEST_FILES } from "../../extensions/generated-manifest-files.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -287,6 +289,44 @@ describe("core-extension-instance-coupling-ban gate", () => {
     expect(m2).not.toContain("@scope/y:a.b(c)");
   });
 
+  it("allowlistShapeDefects rejects entries whose masking would hide a banned coupling shape (cinatra#151 Stage 7)", () => {
+    const extensions = {
+      names: new Set(["@scope/x-connector", "@scope/y-skills"]),
+      dirPaths: new Set(["extensions/scope/x-connector"]),
+    };
+    // Banned shapes: a bare package name, an import-specifier, an embedded
+    // real dir path — justification or not, these may never be allowlisted.
+    expect(
+      allowlistShapeDefects(new Map([["@scope/x-connector", "justified but banned"]]), extensions),
+    ).toEqual(["@scope/x-connector — IS a bare extension package name (masking it would hide the exact coupling this gate bans)"]);
+    expect(
+      allowlistShapeDefects(new Map([["@scope/x-connector/register", "j"]]), extensions).length,
+    ).toBe(1);
+    expect(
+      allowlistShapeDefects(new Map([["prefix:@scope/y-skills/sub", "j"]]), extensions).length,
+    ).toBe(1);
+    expect(
+      allowlistShapeDefects(new Map([["some-id:extensions/scope/x-connector", "j"]]), extensions).length,
+    ).toBe(1);
+    // The LEGITIMATE contract-ID shape — a package name behind a
+    // non-specifier boundary — stays mintable (with an owner ruling).
+    expect(
+      allowlistShapeDefects(new Map([["@scope/y-skills:make-things", "stable capability key"]]), extensions),
+    ).toEqual([]);
+    // A path-SHAPED id that is not a REAL extension dir is fine too.
+    expect(
+      allowlistShapeDefects(new Map([["x:extensions/other/thing", "j"]]), extensions),
+    ).toEqual([]);
+  });
+
+  it("the LIVE allowlist has no shape defects against the real extension tree (and is EMPTY at the zero-floor end-state)", () => {
+    const extensions = { names: discoverExtensionNames(), dirPaths: new Set() };
+    expect(allowlistShapeDefects(DATA_CONTRACT_ID_ALLOWLIST, extensions)).toEqual([]);
+    // Acceptance pin (cinatra#151): the allowlist stays EMPTY unless an
+    // owner ruling mints an entry.
+    expect(DATA_CONTRACT_ID_ALLOWLIST.size).toBe(0);
+  });
+
   it("growthAllowance NEVER permits growth — the zero-tolerance flip (#36) retired the epoch recompute path", () => {
     // THE bypass-resistance pin: the formerly sanctioned one-step epoch
     // advance (base N, committed N+1 == script epoch) no longer allows growth
@@ -330,10 +370,24 @@ describe("core-extension-instance-coupling-ban gate", () => {
     expect(baselineGrowth({ "a :: package :: @x/y": 2 }, { "a :: package :: @x/y": 1 })).toEqual([]);
   });
 
-  it("the committed repo state PASSES the gate (no NEW coupling vs the baseline)", () => {
+  it("the committed repo state PASSES the gate (baseline PINNED EMPTY)", () => {
     const res = runGate();
     expect(res.status, res.stderr || res.stdout).toBe(0);
-    expect(res.stdout).toMatch(/no NEW instance coupling/);
+    expect(res.stdout).toMatch(/zero hardcoded extension-instance references/);
+    expect(res.stdout).toMatch(/PINNED EMPTY/);
+  });
+
+  it("the committed baseline FILE is empty (a re-populated baseline is itself a failure — zero-floor flip, cinatra#151 Stage 7)", () => {
+    const doc = JSON.parse(
+      readFileSync(join(REPO_ROOT, "scripts/audit/core-extension-instance-coupling-ban.baseline.json"), "utf8"),
+    );
+    expect(doc.occurrences).toEqual({});
+    expect(doc.note).toMatch(/PINNED EMPTY/);
+    // The frozen epoch + the pinned-zero classification summary survive as
+    // tamper checks / tooling-shape compatibility.
+    expect(doc.scannerEpoch).toBe(SCANNER_EPOCH);
+    expect(doc.classificationSummary["runtime-coupling"].occurrences).toBe(0);
+    expect(doc.classificationSummary.mechanical.occurrences).toBe(0);
   });
 
   it("fails CLOSED on a set-but-unresolvable base ref", () => {
