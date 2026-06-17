@@ -38,6 +38,32 @@ function normalizeRepositoryName(value: string) {
   return value.replace(/\.git$/i, "").trim();
 }
 
+/**
+ * Local fail-closed containment barrier (js/path-injection, code-scanning).
+ *
+ * Resolve a filesystem target and assert it stays inside the fixed skills data
+ * root BEFORE any destructive (`rm`/`mkdir`) or read (`existsSync`/`readdir`/
+ * `readFile`) operation touches it. The install/sync callers already validate
+ * `owner`/`repo` (see `isSafeOwnerAndRepo`, #291), so this never trips for
+ * legitimate input — but the assertion is what CodeQL recognizes as a
+ * flow-breaking sanitizer, and it makes the chokepoints safe regardless of a
+ * future/unvalidated caller (e.g. the recursive `rm` in
+ * `cloneGitHubRepoToDirectory` runs on the function parameter BEFORE the
+ * per-entry containment loop).
+ *
+ * Returns the resolved, confined path so the caller feeds the
+ * sanitizer-normalized value into the sink (which CodeQL tracks as the barrier
+ * output, breaking the tainted flow).
+ */
+function assertWithinSkillsRoot(targetDirectory: string, errorMessage: string): string {
+  const skillsRoot = path.resolve(getSkillsDataRootPath());
+  const resolvedTarget = path.resolve(targetDirectory);
+  if (resolvedTarget !== skillsRoot && !resolvedTarget.startsWith(skillsRoot + path.sep)) {
+    throw new Error(errorMessage);
+  }
+  return resolvedTarget;
+}
+
 // GitHub owner (user/org) login charset: alphanumerics and single hyphens.
 // GitHub repository-name charset: alphanumerics plus `.`, `_`, `-`.
 // Neither may be `.`/`..` nor contain a path separator. These guards are the
@@ -204,7 +230,8 @@ async function cloneGitHubRepoToDirectory(input: {
   /** Optional tag / branch / sha. When undefined the repository's default branch is used. */
   ref?: string;
 }) {
-  const { octokit, owner, repo, targetDirectory, ref } = input;
+  const { octokit, owner, repo, ref } = input;
+  let targetDirectory = input.targetDirectory;
 
   const repoResponse = await octokit.rest.repos.get({ owner, repo });
   let treeSha: string;
@@ -226,6 +253,19 @@ async function cloneGitHubRepoToDirectory(input: {
     throw new Error("The selected GitHub repository is too large to sync through the current tree API flow.");
   }
 
+  // Fail-closed local barrier (js/path-injection). The destructive recursive
+  // `rm` below runs on the `targetDirectory` PARAMETER before the per-entry
+  // containment loop, so confine it to the skills data root here regardless of
+  // what the caller passed. Callers already validate `owner`/`repo` (#291); a
+  // legitimate target never trips this. Reassign `targetDirectory` to the
+  // resolved/confined path so CodeQL tracks the sanitizer output into the
+  // `rm`/`mkdir` sinks below (the sink reads the barrier's return value; the
+  // variable name is immaterial to the dataflow).
+  targetDirectory = assertWithinSkillsRoot(
+    targetDirectory,
+    "Refusing to sync: clone target escapes the skills data root.",
+  );
+
   await rm(targetDirectory, { recursive: true, force: true });
   await mkdir(targetDirectory, { recursive: true });
 
@@ -233,16 +273,20 @@ async function cloneGitHubRepoToDirectory(input: {
   // tree paths cannot themselves contain `..` components (Git rejects them in
   // tree objects), but we never write a path that resolves outside the clone
   // target regardless of what the API returns (js/path-injection).
-  const resolvedTarget = path.resolve(targetDirectory);
-
+  // `targetDirectory` is the confined base asserted above.
   for (const entry of treeResponse.data.tree) {
     if (!entry.path) continue;
 
+    // Build the destination from the confined `targetDirectory` base (the
+    // barrier output asserted above), then re-confirm the resolved entry stays
+    // inside it. This is the #291 per-entry pattern; rooting it on the
+    // sanitizer output makes the mkdir/writeFile/chmod sinks below tracked as
+    // confined (js/path-injection).
     const destinationPath = path.join(targetDirectory, entry.path);
     const resolvedDestination = path.resolve(destinationPath);
     if (
-      resolvedDestination !== resolvedTarget &&
-      !resolvedDestination.startsWith(resolvedTarget + path.sep)
+      resolvedDestination !== targetDirectory &&
+      !resolvedDestination.startsWith(targetDirectory + path.sep)
     ) {
       // Skip any entry that would escape the clone target.
       continue;
@@ -372,11 +416,14 @@ export async function installSkillPackageFromGitHub(
   // workspace-tier installs; they land at workspace/<owner>/<repo>/.
   // `getSkillsDataRootPath()` honors config + worktree isolation, and the
   // workspace scope prevents top-level package layouts from being created.
-  const targetDirectory = path.join(
-    getSkillsDataRootPath(),
-    "workspace",
-    repository.owner,
-    repository.repo,
+  const targetDirectory = assertWithinSkillsRoot(
+    path.join(
+      getSkillsDataRootPath(),
+      "workspace",
+      repository.owner,
+      repository.repo,
+    ),
+    `Refusing to install ${packageId}: resolved target escapes the skills data root.`,
   );
 
   // Clobber guard. slugify() can produce a collision when two repositories
