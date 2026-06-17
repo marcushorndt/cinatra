@@ -10,10 +10,10 @@
 import "server-only";
 import { Client, Pool, type PoolClient } from "pg";
 import { cp, mkdir, readdir, rename, rm, writeFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { existsSync, lstatSync } from "node:fs";
 import path from "node:path";
 
-import { getSkillsDataRootPath } from "./skills-store";
+import { getSkillsDataRootPath, isRealpathContained } from "./skills-store";
 
 const POLL_BACKSTOP_MS = 5 * 60 * 1000; // 5 minutes — backstop in case NOTIFY is missed
 const NOTIFY_CHANNEL = "cinatra_path_relocations_pending";
@@ -60,12 +60,69 @@ function resolveRelocationAbsPath(stored: string): string {
   // The path-escape guard asserts the resolved abs stays under the root.
   const root = rootSkillsAbs();
   const abs = path.resolve(root, stored);
+  // Layer 1 — lexical containment (KEEP; rejects `..` traversal in the stored
+  // relative path before any fs op).
   if (abs !== root && !abs.startsWith(root + path.sep)) {
     throw new Error(
       `[path-escape guard] resolved abs="${abs}" is not under skills root="${root}" (input="${stored}")`,
     );
   }
+  // Layer 2 — realpath containment (#300). The stored path is the single
+  // chokepoint feeding the rename/cp/readdir/rm/writeFile sinks; a symlinked
+  // ANCESTOR under the skills root passes the lexical prefix check but resolves
+  // OUT of the root, so a move/marker-write would escape. Re-assert on the real
+  // paths (nearest-existing-ancestor realpath handles the not-yet-created move
+  // target). Behavior is identical for legitimate non-symlink paths.
+  if (!isRealpathContained(abs, root)) {
+    throw new Error(
+      `[path-escape guard] real path of abs="${abs}" escapes skills root="${root}" (input="${stored}")`,
+    );
+  }
   return abs;
+}
+
+/**
+ * Write-LEAF confinement for the relocation marker (#300). `resolveRelocationAbsPath`
+ * realpath-confines the move's `oldAbs`/`newAbs` DIRECTORIES, but the marker
+ * LEAF (`<oldAbs>/.cinatra-moving.json`) is composed AFTER that and is itself
+ * unconfined: an attacker who plants a pre-existing symlink at that leaf (the
+ * old skill dir already exists on disk) pointing OUT of the skills root would
+ * have the marker `writeFile` follow it and clobber an arbitrary outside file.
+ * When the leaf already exists, re-assert its REAL path stays inside the skills
+ * root and throw on escape. A not-yet-created leaf is safe — realpath is a
+ * no-op on the missing leaf and the confined `oldAbs` dir anchors it — so
+ * behavior is identical for legitimate moves. Exported for unit testing without
+ * a database (the write path itself is DB-driven).
+ *
+ * Dangling-write-leaf confinement (#300): the `existsSync` realpath check
+ * FOLLOWS symlinks, so a pre-existing DANGLING symlink leaf (file present,
+ * target absent) makes `existsSync` return false and slips through — then the
+ * marker `writeFile` follows the dangling symlink and creates the marker at the
+ * OUTSIDE target. `lstatSync` does NOT follow the symlink, catching the dangling
+ * case; throw on any symlink leaf (consistent with this guard's throw contract)
+ * rather than writing through it. ENOENT (no leaf at all) → genuinely new file,
+ * proceed. A regular file → proceed (the `oldAbs` dir is already confined).
+ */
+export function assertRelocationMarkerLeafContained(markerPath: string): void {
+  if (existsSync(markerPath) && !isRealpathContained(markerPath, rootSkillsAbs())) {
+    throw new Error(
+      `[path-escape guard] relocation marker leaf escapes skills root via symlink: markerPath="${markerPath}"`,
+    );
+  }
+  let stats;
+  try {
+    stats = lstatSync(markerPath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      return; // genuinely new marker — safe to create
+    }
+    throw err;
+  }
+  if (stats.isSymbolicLink()) {
+    throw new Error(
+      `[path-escape guard] relocation marker leaf is a symlink; refusing to write through it: markerPath="${markerPath}"`,
+    );
+  }
 }
 
 // ===========================================================================
@@ -232,6 +289,9 @@ async function processOneRelocation(): Promise<boolean> {
     await mkdir(path.dirname(newAbs), { recursive: true });
 
     const markerPath = path.join(oldAbs, MARKER_FILE_NAME);
+    // Write-LEAF confinement (#300): refuse to write through a pre-existing
+    // marker leaf that is a symlink resolving OUT of the skills root.
+    assertRelocationMarkerLeafContained(markerPath);
     await writeFile(
       markerPath,
       JSON.stringify({

@@ -22,7 +22,7 @@
  * Returns `{ registered, skipped }`. Never throws — per-agent and
  * per-skill failures are collected in `skipped` with a reason.
  */
-import { type Dirent, type Stats } from "fs";
+import { type Dirent, type Stats, existsSync, realpathSync } from "fs";
 import { readdir, readFile, stat } from "node:fs/promises";
 import path from "path";
 import { upsertSkill } from "./skills-store";
@@ -63,9 +63,63 @@ function isValidDirectorySlug(slug: string): boolean {
  * child, or `null` when it escapes (the function contract never throws — the
  * caller pushes a `skipped` reason instead).
  */
-function resolveWithin(parentResolved: string, segment: string): string | null {
+/**
+ * Realpath the nearest EXISTING ancestor of `target` (#300 symlink-containment
+ * support). Realpath of a not-yet-created leaf throws (`ENOENT`), so walk up
+ * until an existing path is found and canonicalize THAT. Falls back to the
+ * lexical resolve at the filesystem root (defensive).
+ */
+function realpathNearestExisting(target: string): string {
+  let current = path.resolve(target);
+  for (;;) {
+    if (existsSync(current)) {
+      return realpathSync.native(current);
+    }
+    const parent = path.dirname(current);
+    if (parent === current) {
+      return current;
+    }
+    current = parent;
+  }
+}
+
+/**
+ * File-LEAF realpath confinement (the next layer beyond #300's directory
+ * containment). `resolveWithin` confines a child DIRECTORY against its parent,
+ * but a confined directory can still hold a FILE that is a symlink to outside —
+ * e.g. `agents/<slug>/skills/<skill>/SKILL.md -> /outside/secret` — and
+ * `readFile` would follow it. Before reading any content file rooted on a
+ * confined base dir, assert the file's REAL path stays inside the REAL base
+ * dir. A non-existent file is already skipped by the read's own try/catch, so
+ * only confine when it exists (realpath of a missing leaf throws). Returns
+ * `true` when the leaf is contained (or absent), `false` on a symlink escape,
+ * matching the function's no-throw per-item contract (the caller pushes a
+ * `skipped` reason instead of throwing). Behavior is identical for legitimate
+ * non-symlink files (realpath is a no-op on those).
+ */
+function fileLeafContainedIn(baseDirResolved: string, fileResolved: string): boolean {
+  if (!existsSync(fileResolved)) {
+    return true;
+  }
+  const realBase = realpathNearestExisting(baseDirResolved);
+  const realFile = realpathNearestExisting(fileResolved);
+  return realFile === realBase || realFile.startsWith(realBase + path.sep);
+}
+
+export function resolveWithin(parentResolved: string, segment: string): string | null {
   const childResolved = path.resolve(parentResolved, segment);
+  // Layer 1 — lexical containment (KEEP; defense in depth).
   if (childResolved !== parentResolved && !childResolved.startsWith(parentResolved + path.sep)) {
+    return null;
+  }
+  // Layer 2 — realpath containment (#300). A symlinked ANCESTOR under
+  // `parentResolved` passes the lexical prefix check but resolves OUT of the
+  // parent via the link target. Canonicalize the parent and child (nearest
+  // existing ancestor for not-yet-created leaves) and re-check; return null on
+  // escape, matching the function's no-throw contract.
+  const realParent = realpathNearestExisting(parentResolved);
+  const realChild = realpathNearestExisting(childResolved);
+  if (realChild !== realParent && !realChild.startsWith(realParent + path.sep)) {
     return null;
   }
   return childResolved;
@@ -143,7 +197,28 @@ export async function compileAndRegisterAgentSkillsForRepo(input: {
       continue;
     }
     const pkgJsonPath = path.join(agentDir, "package.json");
-    const skillsDir = path.join(agentDir, "skills");
+
+    // Confine the `skills` subdir within `agentDir` before the readdir below
+    // (js/path-injection). 'skills' is a literal so this never trips for a
+    // legitimate non-symlink tree, but if `agents/<slug>/skills` is itself a
+    // SYMLINK to an outside directory, the per-skill resolveWithin(skillsDir, …)
+    // would canonicalize the link's OUTSIDE target as its realParent and treat
+    // every child as contained — reading SKILL.md outside the repo root. Rooting
+    // `skillsDir` on a base proven inside the repo root closes that escape.
+    const skillsDir = resolveWithin(agentDir, "skills");
+    if (!skillsDir) {
+      result.skipped.push({ slug: dirSlug, reason: `skills dir escapes the agent root "${dirSlug}"` });
+      continue;
+    }
+
+    // Leaf confinement (file-symlink escape): `package.json` lexically lives in
+    // the confined `agentDir`, but if it is itself a SYMLINK to an outside file
+    // `readFile` would follow it. Assert the real file stays inside the real
+    // agent dir before reading; skip (no-throw) on escape.
+    if (!fileLeafContainedIn(agentDir, pkgJsonPath)) {
+      result.skipped.push({ slug: dirSlug, reason: "package.json escapes the agent dir (symlink)" });
+      continue;
+    }
 
     let pkgRaw: string;
     try {
@@ -217,6 +292,20 @@ export async function compileAndRegisterAgentSkillsForRepo(input: {
         continue;
       }
       const skillMdPath = path.join(skillDir, "SKILL.md");
+
+      // Leaf confinement (file-symlink escape): `SKILL.md` lexically lives in
+      // the confined `skillDir`, but if it is itself a SYMLINK to an outside
+      // file `readFile` would follow it and ingest content from outside the
+      // repo. Assert the real file stays inside the real skill dir before
+      // reading; skip (no-throw) on escape.
+      if (!fileLeafContainedIn(skillDir, skillMdPath)) {
+        result.skipped.push({
+          slug: `${dirSlug}/${skillEntryName}`,
+          reason: "SKILL.md escapes the skill dir (symlink)",
+        });
+        continue;
+      }
+
       let skillContent: string;
       try {
         skillContent = (await readFile(skillMdPath, "utf8")) as string;
