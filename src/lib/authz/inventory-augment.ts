@@ -103,6 +103,21 @@ export const PRIMITIVE_CLASSIFICATIONS: Record<string, PrimitiveClassification> 
   artifact_representation_get:      { resourceType: "artifact", action: "read",   status: "enforced" },
   artifact_representation_latest:   { resourceType: "artifact", action: "read",   status: "enforced" },
   artifact_representation_list:     { resourceType: "artifact", action: "list",   status: "enforced" },
+  // artifact_source_* — admin-only ARTIFACT EXTENSION PACKAGE authoring (SDK-P5,
+  // eng#167). DISTINCT from artifact_authoring_emit (an artifact INSTANCE emit,
+  // artifact::create). There is no dedicated artifact_extension resourceType (cf.
+  // workflow_extension, which pre-existed), so — like the agent path — these map
+  // onto the base `artifact` resource: validate = read; write + compile = update
+  // (privileged on-disk package mutation/build); publish = create (the closest
+  // "materialize a new artifact thing" verb the registry exposes — there is no
+  // artifact publish/share action). The TRUE authority boundary for all four is
+  // the handler's platform_admin gate, so this kernel mapping is interim/least-
+  // privilege within the existing pairs; promote to an artifact_extension::publish
+  // boundary if/when non-admin release_manager publish is wanted. status enforced.
+  artifact_source_compile:          { resourceType: "artifact", action: "update", status: "enforced" },
+  artifact_source_publish:          { resourceType: "artifact", action: "create", status: "enforced" },
+  artifact_source_validate:         { resourceType: "artifact", action: "read",   status: "enforced" },
+  artifact_source_write:            { resourceType: "artifact", action: "update", status: "enforced" },
   artifacts_get:                    { resourceType: "artifact", action: "read",   status: "enforced" },
   artifacts_list:                   { resourceType: "artifact", action: "list",   status: "enforced" },
   artifacts_tombstone:              { resourceType: "artifact", action: "delete", status: "enforced" },
@@ -311,6 +326,18 @@ export const PRIMITIVE_CLASSIFICATIONS: Record<string, PrimitiveClassification> 
   workflow_draft_update:       { resourceType: "workflow_draft",    action: "update",  status: "enforced" },
   workflow_preview:            { resourceType: "workflow_draft",    action: "read",    status: "enforced" },
   workflow_save_as_template:   { resourceType: "workflow_template", action: "create",  status: "enforced" },
+  // workflow_source_* — admin-only WORKFLOW EXTENSION PACKAGE authoring (SDK-P5,
+  // eng#167). Mirror of agent_source_* but classified against the dedicated
+  // workflow_extension resourceType where one exists: validate = a read of the
+  // package's BPMN sidecar; publish = the registered workflow_extension.publish
+  // capability (admin / release_manager). write + compile are privileged on-disk
+  // package mutation/build — workflow_extension has no write/update action, so
+  // they map to the closest registered pair, workflow.update (NOT a runtime
+  // workflow-row edit; least-privilege within the registry's existing pairs).
+  workflow_source_compile:     { resourceType: "workflow",           action: "update",  status: "enforced" },
+  workflow_source_publish:     { resourceType: "workflow_extension", action: "publish", status: "enforced" },
+  workflow_source_validate:    { resourceType: "workflow_extension", action: "read",    status: "enforced" },
+  workflow_source_write:       { resourceType: "workflow",           action: "update",  status: "enforced" },
   workflow_status_get:         { resourceType: "workflow",          action: "read",    status: "enforced" },
   workflow_status_list:        { resourceType: "workflow",          action: "list",    status: "enforced" },
   workflow_artifacts_list:     { resourceType: "workflow",          action: "read",    status: "enforced" },
@@ -320,6 +347,22 @@ export const PRIMITIVE_CLASSIFICATIONS: Record<string, PrimitiveClassification> 
   workflow_validate:           { resourceType: "workflow_draft",    action: "read",    status: "enforced" },
 
   // ───── skill ─────
+  // skill_source_* — admin-only SKILL EXTENSION PACKAGE authoring (SDK-P5,
+  // eng#167). DISTINCT from the skills_* mutations below: skills_personal_upsert /
+  // skills_installed_upsert mutate a skill ROW (skill::update), and
+  // skills_packages_install* INSTALLS a published package (skill::install). These
+  // author/publish a reusable skill TYPE PACKAGE. No dedicated skill_extension
+  // resourceType exists, so — like the agent/artifact paths — they map onto the
+  // base `skill` resource: validate = read; write + compile = update (privileged
+  // on-disk package mutation/build, the SAME pair as the install/upsert row
+  // mutations — a precision overlap, not an access bug: the platform_admin
+  // handler gate is the TRUE boundary); publish = create (no skill publish/share
+  // action exists). Interim/least-privilege; promote to skill_extension::publish
+  // if non-admin release_manager publish is later wanted. status enforced.
+  skill_source_compile:                       { resourceType: "skill", action: "update",  status: "enforced" },
+  skill_source_publish:                       { resourceType: "skill", action: "create",  status: "enforced" },
+  skill_source_validate:                      { resourceType: "skill", action: "read",    status: "enforced" },
+  skill_source_write:                         { resourceType: "skill", action: "update",  status: "enforced" },
   skills_catalog_list:                        { resourceType: "skill", action: "list",    status: "enforced" },
   skills_installed_get:                       { resourceType: "skill", action: "read",    status: "enforced" },
   skills_installed_list:                      { resourceType: "skill", action: "list",    status: "enforced" },

@@ -1,5 +1,5 @@
 import { revalidatePath } from "next/cache";
-import { existsSync, readdirSync, readFileSync } from "fs";
+import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync } from "fs";
 import { mkdir, writeFile, rm } from "fs/promises";
 import path from "path";
 import { readConnectorConfigFromDatabase, writeConnectorConfigToDatabase, readSkillCatalogFromDatabase, replaceSkillCatalogInDatabase, getPostgresConnectionString, postgresSchema } from "@/lib/database";
@@ -458,7 +458,12 @@ function parseFrontmatter(content: string) {
 
 function readPluginManifestLevel(packageRootPath: string): SkillLevel | undefined {
   const pluginJsonPath = path.join(packageRootPath, "cinatra", "plugin.json");
-  if (!existsSync(pluginJsonPath)) return undefined;
+  // Leaf confinement (file-symlink escape, #300): `packageRootPath` is a
+  // confined package dir, but a `cinatra/plugin.json` that is a SYMLINK to an
+  // outside file would be followed by the `readFileSync` below. Skip (treat as
+  // no manifest) when the real file escapes the real package dir.
+  if (!existsSync(pluginJsonPath) || !isFileLeafContainedInDir(packageRootPath, pluginJsonPath))
+    return undefined;
   try {
     const manifest = JSON.parse(readFileSync(pluginJsonPath, "utf8")) as { skills?: { type?: string } };
     const type = manifest.skills?.type;
@@ -484,12 +489,36 @@ type DiscoveredSkillDirectory = {
 };
 
 function collectSkillDirectories(searchRootPath: string, relativeDirectoryPath = ""): DiscoveredSkillDirectory[] {
-  if (!searchRootPath || !existsSync(searchRootPath)) {
+  if (!searchRootPath) {
+    return [];
+  }
+
+  // Fail-closed containment barrier (js/path-injection). Confine the
+  // externally-supplied BASE directory to the allowed skill roots exactly once,
+  // at the top-level call (`relativeDirectoryPath === ""`). Every current caller
+  // already passes a base-confined root; this rejects a traversing base before
+  // any fs read. Recursive descents (non-empty relative path) skip the guard:
+  // their base is a previously-confined parent joined with a readdir'd child
+  // name, which can never be `..`. Rebinding to the resolved value feeds the
+  // barrier output into the existsSync/readdirSync sinks below.
+  if (relativeDirectoryPath === "") {
+    searchRootPath = assertSkillDirectoryInsideRoot(searchRootPath);
+  }
+
+  if (!existsSync(searchRootPath)) {
     return [];
   }
 
   const skillFilePath = path.join(searchRootPath, "SKILL.md");
   if (existsSync(skillFilePath)) {
+    // Leaf confinement (file-symlink escape): `searchRootPath` is confined to
+    // the skill roots, but if `SKILL.md` inside it is a SYMLINK to an outside
+    // file the downstream `readFileSync(skillFilePath)` would follow it. When
+    // the real file escapes the real directory, treat this dir as having no
+    // skill (drop the discovery) so the escaping file is never read/ingested.
+    if (!isFileLeafContainedInDir(searchRootPath, skillFilePath)) {
+      return [];
+    }
     return [
       {
         slug: path.basename(searchRootPath),
@@ -541,8 +570,17 @@ function scanInstalledPackageCatalog() {
       license: installedPackage.license,
       authors: installedPackage.authors,
       repositoryPath: installedPackage.repositoryPath,
-      readmeContent: existsSync(readmePath) ? readFileSync(readmePath, "utf8") : undefined,
-      licenseText: existsSync(licensePath) ? readFileSync(licensePath, "utf8") : undefined,
+      // Leaf confinement (file-symlink escape): README/LICENSE lexically live in
+      // `catalogDocumentPath`, but a file-symlink to outside would be followed by
+      // `readFileSync`. Skip the read when the real file escapes the real dir.
+      readmeContent:
+        existsSync(readmePath) && isFileLeafContainedInDir(catalogDocumentPath, readmePath)
+          ? readFileSync(readmePath, "utf8")
+          : undefined,
+      licenseText:
+        existsSync(licensePath) && isFileLeafContainedInDir(catalogDocumentPath, licensePath)
+          ? readFileSync(licensePath, "utf8")
+          : undefined,
       isCustom: false,
       level: packageLevel,
     };
@@ -646,7 +684,11 @@ function scanInstalledPackageCatalog() {
       // page render with empty repository/license/authors fields.
       const markerPath = path.join(repoDir, ".cinatra-skill-source.json");
       let markerPackageId: string | null = null;
-      if (existsSync(markerPath)) {
+      // Leaf confinement (file-symlink escape, #300): `repoDir` is confined,
+      // but a `.cinatra-skill-source.json` symlinked to an outside file would
+      // be followed by `readFileSync`. Skip the read when the real file escapes
+      // the real package dir (treated as no marker, the malformed-marker path).
+      if (existsSync(markerPath) && isFileLeafContainedInDir(repoDir, markerPath)) {
         try {
           const marker = JSON.parse(readFileSync(markerPath, "utf8")) as { packageId?: unknown };
           if (typeof marker.packageId === "string" && marker.packageId.length > 0) {
@@ -666,7 +708,13 @@ function scanInstalledPackageCatalog() {
         packageId = markerPackageId;
       } else {
         try {
-          packageId = (JSON.parse(readFileSync(pkgJsonPath, "utf8")) as { name?: string }).name?.trim() || `installed:${packageSlug}`;
+          // Leaf confinement (file-symlink escape, #300): a `package.json`
+          // symlinked to an outside file would be followed by `readFileSync`.
+          // On escape, fall through to the `installed:<slug>` derivation rather
+          // than ingesting the outside file's `name`.
+          packageId = isFileLeafContainedInDir(repoDir, pkgJsonPath)
+            ? (JSON.parse(readFileSync(pkgJsonPath, "utf8")) as { name?: string }).name?.trim() || `installed:${packageSlug}`
+            : `installed:${packageSlug}`;
         } catch {
           packageId = `installed:${packageSlug}`;
         }
@@ -694,8 +742,18 @@ function scanInstalledPackageCatalog() {
         slug: packageSlug,
         description: `Skills package from ${packageSlug}.`,
         repositoryPath: repoDir,
-        readmeContent: existsSync(readmePath) ? readFileSync(readmePath, "utf8") : undefined,
-        licenseText: existsSync(licensePath) ? readFileSync(licensePath, "utf8") : undefined,
+        // Leaf confinement (file-symlink escape, #300): README/LICENSE lexically
+        // live in the confined `repoDir`, but a file-symlink to outside would be
+        // followed by `readFileSync`. Skip the read when the real file escapes
+        // the real dir (mirrors the scanInstalledPackageCatalog probe above).
+        readmeContent:
+          existsSync(readmePath) && isFileLeafContainedInDir(repoDir, readmePath)
+            ? readFileSync(readmePath, "utf8")
+            : undefined,
+        licenseText:
+          existsSync(licensePath) && isFileLeafContainedInDir(repoDir, licensePath)
+            ? readFileSync(licensePath, "utf8")
+            : undefined,
         isCustom: !pluginLevel,
         level: resolvedLevel,
       };
@@ -1150,6 +1208,51 @@ export async function upsertSkill(input: {
   );
   const skillFilePath = path.join(skillDiskDir, "SKILL.md");
 
+  // Strict write-side containment (js/path-injection). The disk segments are
+  // slug-derived/actor-bound today, but assert BEFORE we mutate the catalog or
+  // touch the filesystem so a future regression in slug derivation (or a stray
+  // `..` reaching `skillSlug`/`storagePackagePath`) can never escape the store.
+  //
+  // Two layers:
+  //   1. Reject any `.`/`..` traversal segment in the derived path components.
+  //      The `storagePackagePath` agent branch legitimately uses `/` separators
+  //      (vendor/pkg), so we forbid only the dot-segments, not separators.
+  //   2. Resolve the final path and require it inside the *canonical* skill
+  //      store root. Unlike the read-side `assertSkillFilePathInsideRoot`
+  //      (which also tolerates the legacy `data/skills` root for compat), new
+  //      writes must land in the canonical store — this prevents a crafted
+  //      segment from resolving into the sibling legacy root for a cross-root
+  //      clobber.
+  for (const segment of [input.storagePackagePath ?? packageSlug, skillSlug, input.ownerUserId ?? ""]) {
+    if (segment.split(/[/\\]/).some((part) => part === ".." || part === ".")) {
+      throw new Error("Refusing to write a skill to a path containing a traversal segment.");
+    }
+  }
+  const canonicalStoreRoot = path.resolve(getSkillStoreRootPath());
+  const resolvedSkillDir = path.resolve(skillDiskDir);
+  if (
+    resolvedSkillDir !== canonicalStoreRoot &&
+    !resolvedSkillDir.startsWith(canonicalStoreRoot + path.sep)
+  ) {
+    throw new Error("Skill write path is outside the canonical skill store root.");
+  }
+  // Layer 3 — realpath containment (#300). The lexical prefix check above is
+  // satisfied by a path whose ANCESTOR (e.g. `workspace/<pkg>`) is a SYMLINK
+  // pointing outside the store; the downstream `mkdir`/`writeFile` would then
+  // materialize the SKILL.md OUTSIDE the canonical store. Canonicalize the
+  // store root and the resolved skill DIR (nearest-existing-ancestor realpath
+  // handles the not-yet-created leaf) and re-assert containment on the real
+  // paths. Also confine the SKILL.md leaf itself: a pre-existing symlinked
+  // leaf would have `writeFile` follow it out of the store. Behavior is
+  // identical for legitimate non-symlink and not-yet-created paths (realpath
+  // is a no-op on those).
+  if (
+    !isRealpathContained(resolvedSkillDir, canonicalStoreRoot) ||
+    !isFileLeafContainedInDir(canonicalStoreRoot, skillFilePath)
+  ) {
+    throw new Error("Skill write path is outside the canonical skill store root.");
+  }
+
   const defaultDescription = isPersonal
     ? `Custom skill for ${input.agentId ?? "this agent"}.`
     : "User-created skill.";
@@ -1221,6 +1324,11 @@ export async function upsertSkill(input: {
 
   // Write SKILL.md to disk so the local path is available to the LLM shell tool.
   await mkdir(skillDiskDir, { recursive: true });
+  // Dangling-write-leaf confinement (#300): the realpath checks above use
+  // existsSync (follows symlinks) so a pre-existing DANGLING symlink leaf would
+  // slip through and `writeFile` would create the SKILL.md at the outside
+  // target. lstat catches the dangling symlink; throw rather than write through.
+  assertLeafNotSymlink(skillFilePath);
   await writeFile(skillFilePath, skillRecord.content, "utf8");
   commitSkillChange(`skill: save ${input.type} skill '${skillRecord.name}'`).catch(() => undefined);
 
@@ -1371,6 +1479,93 @@ export const upsertPersonalSkill = upsertCustomSkill;
  * satisfy the containment.
  */
 /**
+ * Realpath the nearest EXISTING ancestor of `target` (#300 symlink-containment
+ * support). Realpath of a not-yet-created leaf throws (`ENOENT`), so we walk up
+ * until a path that exists is found and canonicalize THAT — the missing
+ * trailing segments cannot themselves be a symlink (they don't exist), so the
+ * realpath'd ancestor is the correct containment anchor. Falls back to the
+ * lexical resolve at the filesystem root (defensive; the root always exists).
+ */
+function realpathNearestExisting(target: string): string {
+  let current = path.resolve(target);
+  for (;;) {
+    if (existsSync(current)) {
+      return realpathSync.native(current);
+    }
+    const parent = path.dirname(current);
+    if (parent === current) {
+      return current;
+    }
+    current = parent;
+  }
+}
+
+/**
+ * Realpath-containment re-assertion (#300). After the lexical resolve+prefix
+ * check confirms `resolved` is lexically inside one of the allowed roots, this
+ * canonicalizes the root and the target (via the nearest existing ancestor for
+ * not-yet-created leaves) and re-checks containment on the REAL paths. A
+ * symlinked ancestor under a root passes the lexical check but resolves OUT of
+ * it — this layer rejects that. Behavior is identical for legitimate
+ * non-symlink and not-yet-created paths (realpath is a no-op on those).
+ */
+export function isRealpathContained(resolved: string, root: string): boolean {
+  const realRoot = realpathNearestExisting(root);
+  const realTarget = realpathNearestExisting(resolved);
+  return realTarget === realRoot || realTarget.startsWith(realRoot + path.sep);
+}
+
+/**
+ * File-LEAF realpath confinement (the next layer beyond #300's directory
+ * containment). `assertSkillDirectoryInsideRoot` confines a scan/repository
+ * BASE directory, but a confined directory can still hold a FILE that is a
+ * symlink to outside — e.g. `<repositoryPath>/README.md -> /outside/secret`, or
+ * a discovered `<skillDir>/SKILL.md` symlinked out — and a `readFileSync` would
+ * follow it. Before reading any content file rooted on an already-confined base
+ * dir, assert the file's REAL path stays inside the REAL base dir. A
+ * non-existent file is already skipped by its own `existsSync` gate, so this
+ * only confines existing leaves (and realpath is a no-op on non-symlink files,
+ * keeping behavior identical for legitimate layouts). Returns `false` on a
+ * symlink escape so the caller skips the read instead of exfiltrating an
+ * arbitrary local file.
+ */
+function isFileLeafContainedInDir(baseDir: string, filePath: string): boolean {
+  return isRealpathContained(path.resolve(filePath), path.resolve(baseDir));
+}
+
+/**
+ * Dangling-write-leaf confinement (#300). The directory + leaf realpath checks
+ * above use `existsSync`, which FOLLOWS symlinks: a leaf that is a DANGLING
+ * symlink (the symlink file pre-exists but its target does NOT) makes
+ * `existsSync` return false, so the realpath checks treat it as an absent /
+ * not-yet-created leaf and pass — then `writeFile` follows the dangling symlink
+ * and CREATES the file at the OUTSIDE target. `lstatSync` does NOT follow the
+ * symlink, so it catches the dangling case. Call this immediately before any
+ * write whose leaf was only confined via `existsSync`/nearest-ancestor realpath.
+ * ENOENT (no leaf at all) → genuinely new file, proceed. A regular file →
+ * proceed (the dir is already realpath-confined and overwriting a regular file
+ * stays inside). A symlink (dangling or live) → throw, refusing to write
+ * through it. Behavior is identical for legitimate new-file and regular-file
+ * writes (lstat is a no-op decision on those).
+ */
+function assertLeafNotSymlink(leafPath: string): void {
+  let stats;
+  try {
+    stats = lstatSync(leafPath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      return; // genuinely new file — safe to create
+    }
+    throw err;
+  }
+  if (stats.isSymbolicLink()) {
+    throw new Error(
+      `Skill write path leaf is a symlink; refusing to write through it: ${leafPath}`,
+    );
+  }
+}
+
+/**
  * Strict-containment guard for any direct read of a stored skill `sourcePath`.
  * Callers that read raw bytes (e.g. the Anthropic sync uploader needs a Buffer
  * via `fs.readFile(p)` — not a UTF-8 string) MUST run this first so a
@@ -1387,6 +1582,7 @@ export function assertSkillFilePathInsideRoot(filePath: string): void {
   const storeRoot = path.resolve(getSkillStoreRootPath());
   const legacyRoot = path.resolve(getSkillsDataRootPath());
   const resolved = path.resolve(filePath);
+  // Layer 1 — lexical containment (KEEP; defense in depth).
   const insideStore =
     resolved === storeRoot || resolved.startsWith(storeRoot + path.sep);
   const insideLegacy =
@@ -1394,6 +1590,58 @@ export function assertSkillFilePathInsideRoot(filePath: string): void {
   if (!insideStore && !insideLegacy) {
     throw new Error("Skill file path is outside the allowed skill roots.");
   }
+  // Layer 2 — realpath containment (#300). A symlinked ANCESTOR under either
+  // root passes the lexical prefix check but the real path escapes the root.
+  // Re-assert against the canonicalized root(s) the target lexically matched.
+  const realpathInsideStore = insideStore && isRealpathContained(resolved, storeRoot);
+  const realpathInsideLegacy = insideLegacy && isRealpathContained(resolved, legacyRoot);
+  if (!realpathInsideStore && !realpathInsideLegacy) {
+    throw new Error("Skill file path is outside the allowed skill roots.");
+  }
+}
+
+/**
+ * Directory-path containment barrier (js/path-injection, code-scanning).
+ *
+ * Fail-closed confinement for a repository/scan BASE directory before any
+ * filesystem read (`existsSync`/`readdirSync`/`readFileSync`) walks it. Two
+ * layers, mirroring the #291 write-side guard in `upsertSkill`:
+ *   1. Reject any `.`/`..` traversal segment in the supplied directory so a
+ *      `..` baked into a leaf (e.g. the verdaccio installDir version segment,
+ *      which is not slugified, or a slugify that preserves `.`) cannot escape.
+ *   2. Resolve and require the directory inside EITHER the canonical skill
+ *      store root OR the legacy `data/skills` root (the two roots every current
+ *      caller already lands in), throwing otherwise.
+ *
+ * Returns the resolved, confined path so callers feed the sanitizer-normalized
+ * value into the sink (CodeQL tracks the barrier output, breaking the flow).
+ */
+export function assertSkillDirectoryInsideRoot(directoryPath: string): string {
+  if (directoryPath.split(/[/\\]/).some((part) => part === ".." || part === ".")) {
+    throw new Error("Skill directory path contains a traversal segment.");
+  }
+  const storeRoot = path.resolve(getSkillStoreRootPath());
+  const legacyRoot = path.resolve(getSkillsDataRootPath());
+  const resolved = path.resolve(directoryPath);
+  // Layer 2 — lexical containment (KEEP; defense in depth).
+  const insideStore =
+    resolved === storeRoot || resolved.startsWith(storeRoot + path.sep);
+  const insideLegacy =
+    resolved === legacyRoot || resolved.startsWith(legacyRoot + path.sep);
+  if (!insideStore && !insideLegacy) {
+    throw new Error("Skill directory path is outside the allowed skill roots.");
+  }
+  // Layer 3 — realpath containment (#300). A symlinked ANCESTOR under either
+  // root passes the lexical prefix check but resolves OUT of the root via the
+  // link target. Re-assert against the canonicalized root(s) the target
+  // lexically matched (nearest-existing-ancestor realpath handles a not-yet-
+  // created leaf without throwing).
+  const realpathInsideStore = insideStore && isRealpathContained(resolved, storeRoot);
+  const realpathInsideLegacy = insideLegacy && isRealpathContained(resolved, legacyRoot);
+  if (!realpathInsideStore && !realpathInsideLegacy) {
+    throw new Error("Skill directory path is outside the allowed skill roots.");
+  }
+  return resolved;
 }
 
 export async function readSkillFileContent(filePath: string): Promise<string> {
@@ -1570,8 +1818,27 @@ export async function deleteCustomSkill(input: {
     : existingSkill.ownerUserId
       ? path.join(getSkillsDataRootPath(), "personal", existingSkill.ownerUserId, existingSkill.slug)
       : null;
+  // Confine the derived directory (lexical + realpath, #300) before `rm`. The
+  // `sourcePath` branch derives `dirname(<stored sourcePath>)`, so a
+  // payload-injected/stale stored path — or one whose real path escapes via a
+  // symlinked ancestor — must not have `rm` delete an arbitrary directory.
+  // Custom skills write under the store root (`upsertSkill`); the legacy
+  // fallback lands under the skills data root. Require the dir STRICTLY inside
+  // EITHER root (root-equality excluded by `startsWith(root + sep)`, so the
+  // root itself or its parent is never deleted) AND realpath-confined.
   if (skillDiskDir) {
-    await rm(skillDiskDir, { recursive: true, force: true });
+    const resolvedSkillDiskDir = path.resolve(skillDiskDir);
+    const storeRoot = path.resolve(getSkillStoreRootPath());
+    const legacyRoot = path.resolve(getSkillsDataRootPath());
+    const insideStore =
+      resolvedSkillDiskDir.startsWith(storeRoot + path.sep) &&
+      isRealpathContained(resolvedSkillDiskDir, storeRoot);
+    const insideLegacy =
+      resolvedSkillDiskDir.startsWith(legacyRoot + path.sep) &&
+      isRealpathContained(resolvedSkillDiskDir, legacyRoot);
+    if (insideStore || insideLegacy) {
+      await rm(resolvedSkillDiskDir, { recursive: true, force: true });
+    }
   }
   commitSkillChange(`skill: delete '${input.skillId}'`).catch(() => undefined);
 
@@ -1629,8 +1896,19 @@ export async function upsertRepositoryBackedSkillPackage(input: {
   authors?: string[];
 }) {
   const existingCatalog = await readSkillsCatalog();
-  const readmePath = path.join(input.repositoryPath, "README.md");
-  const licensePath = path.join(input.repositoryPath, "LICENSE");
+
+  // Fail-closed containment barrier (js/path-injection). Confine the
+  // user/LLM-triggered `input.repositoryPath` (github targetDirectory or
+  // verdaccio installDir) to the allowed skill roots BEFORE any fs read. The
+  // github caller is already guarded by isSafeOwnerAndRepo (#291); the
+  // verdaccio installDir leaf segments are weakly sanitized, and this function
+  // had no self-contained guard — so assert here. Using the resolved value for
+  // the README/LICENSE joins and the directory scan feeds the barrier output
+  // into every existsSync/readFileSync sink (covers the README/LICENSE probes
+  // and, via collectSkillDirectories, the per-skill SKILL.md reads).
+  const repositoryPath = assertSkillDirectoryInsideRoot(input.repositoryPath);
+  const readmePath = path.join(repositoryPath, "README.md");
+  const licensePath = path.join(repositoryPath, "LICENSE");
 
   const packageRecord: PersistedSkillPackage = {
     id: input.packageId,
@@ -1641,9 +1919,19 @@ export async function upsertRepositoryBackedSkillPackage(input: {
     sourceUrl: input.sourceUrl ?? input.repositoryUrl,
     repositoryUrl: input.repositoryUrl,
     repositoryPath: input.repositoryPath,
-    readmeContent: existsSync(readmePath) ? readFileSync(readmePath, "utf8") : undefined,
+    // Leaf confinement (file-symlink escape): `repositoryPath` is confined to
+    // the skill roots above, but README/LICENSE inside it could be a SYMLINK to
+    // an outside file that `readFileSync` would follow. Skip the read when the
+    // real file escapes the real repository directory.
+    readmeContent:
+      existsSync(readmePath) && isFileLeafContainedInDir(repositoryPath, readmePath)
+        ? readFileSync(readmePath, "utf8")
+        : undefined,
     license: input.license,
-    licenseText: existsSync(licensePath) ? readFileSync(licensePath, "utf8") : undefined,
+    licenseText:
+      existsSync(licensePath) && isFileLeafContainedInDir(repositoryPath, licensePath)
+        ? readFileSync(licensePath, "utf8")
+        : undefined,
     authors: input.authors,
     isCustom: true,
   };
@@ -1672,7 +1960,7 @@ export async function upsertRepositoryBackedSkillPackage(input: {
   // so the catalog ID matches the consumer ref shape (e.g.
   // `@anthropics/skills:skill-creator`) instead of `verdaccio:@anthropics/skills:skill-creator`.
   const catalogIdPrefix = input.catalogSkillIdPrefix ?? input.packageId;
-  const discoveredSkills = collectSkillDirectories(input.repositoryPath);
+  const discoveredSkills = collectSkillDirectories(repositoryPath);
   const scannedSkills: PersistedSkill[] = discoveredSkills.map((discoveredSkill) => {
     const content = readFileSync(discoveredSkill.skillFilePath, "utf8");
     const { attributes } = parseFrontmatter(content);
@@ -1810,12 +2098,36 @@ export async function deleteAgentSkillsForSlugs(
     // ~agent/<slugifiedNpmName>/ is cleaned up below if it ends up empty.
     if (skill.sourcePath) {
       const resolvedSourcePath = path.resolve(skill.sourcePath);
-      if (resolvedSourcePath.startsWith(skillsRoot + path.sep) || resolvedSourcePath === skillsRoot) {
+      // Confine a STORED `sourcePath` before `rm` (#300). Two bugs the prior
+      // lexical-only guard had:
+      //   1. Root-equality: `resolvedSourcePath === skillsRoot` passed the
+      //      guard, then `dirname(resolvedSourcePath)` is the root's PARENT —
+      //      the `rm` would delete the directory ABOVE the skills root. Only a
+      //      path STRICTLY inside the root may be deleted; the root itself (and
+      //      thus its parent) is never a valid delete target.
+      //   2. Symlinked ancestor: a `sourcePath` whose real path escapes the
+      //      root via a symlinked ancestor passed `startsWith` but resolves
+      //      OUT of the root. Re-assert realpath containment on the resolved
+      //      sourcePath AND on the `skillDir` actually handed to `rm`.
+      const strictlyInside =
+        resolvedSourcePath !== skillsRoot &&
+        resolvedSourcePath.startsWith(skillsRoot + path.sep) &&
+        isRealpathContained(resolvedSourcePath, skillsRoot);
+      if (strictlyInside) {
         const skillDir = path.dirname(resolvedSourcePath);
-        try {
-          await rm(skillDir, { recursive: true, force: true });
-        } catch {
-          // best-effort
+        // `dirname` of a strictly-inside path is at most the root itself; never
+        // rm the root (would clobber the whole store). Require the dir to be
+        // strictly inside and realpath-confined too.
+        const skillDirStrictlyInside =
+          skillDir !== skillsRoot &&
+          skillDir.startsWith(skillsRoot + path.sep) &&
+          isRealpathContained(skillDir, skillsRoot);
+        if (skillDirStrictlyInside) {
+          try {
+            await rm(skillDir, { recursive: true, force: true });
+          } catch {
+            // best-effort
+          }
         }
       }
     }
@@ -1834,11 +2146,27 @@ export async function deleteAgentSkillsForSlugs(
     if (!matchesPrefix && !matchesPackageSlug) continue;
 
     const resolvedSourcePath = path.resolve(skill.sourcePath);
-    if (!resolvedSourcePath.startsWith(skillsRoot + path.sep)) continue;
+    // Confine the STORED `sourcePath` (lexical + realpath, #300) before
+    // deriving the parent dir to clean up. `startsWith(skillsRoot + sep)` also
+    // excludes the root-equality case (the root itself never `startsWith`
+    // root+sep), so the parent computed below can never be the root's parent.
+    if (
+      !resolvedSourcePath.startsWith(skillsRoot + path.sep) ||
+      !isRealpathContained(resolvedSourcePath, skillsRoot)
+    )
+      continue;
     const parentDir = path.dirname(path.dirname(resolvedSourcePath));
     if (seenParentDirs.has(parentDir)) continue;
     seenParentDirs.add(parentDir);
-    if (!parentDir.startsWith(skillsRoot + path.sep)) continue;
+    // `parentDir` (two levels up) must itself be STRICTLY inside the root and
+    // realpath-confined before `readdirSync`/`rm` — a symlinked ancestor could
+    // make the lexically-inside parent resolve OUT of the root. `startsWith`
+    // (not `===`) keeps the root itself off the delete path.
+    if (
+      !parentDir.startsWith(skillsRoot + path.sep) ||
+      !isRealpathContained(parentDir, skillsRoot)
+    )
+      continue;
     try {
       // Only remove if empty, to avoid clobbering siblings.
       const remaining = readdirSync(parentDir);
@@ -1868,9 +2196,26 @@ export async function uninstallSkillPackage(packageId: string) {
   // Order matters: read slugs → rm dir → delete catalog rows → delete
   // agent-skill catalog rows by slug.
   let agentSlugsForCleanup: string[] = [];
-  if (existingPackage.repositoryPath) {
-    const agentsDirPath = path.join(existingPackage.repositoryPath, "agents");
-    if (existsSync(agentsDirPath)) {
+  // Confine the STORED `repositoryPath` (lexical + realpath, #300) BEFORE the
+  // readdir walks it. A payload-injected/stale stored path — or one whose real
+  // path escapes the installed-packages root via a symlinked ancestor — must
+  // not have `readdirSync` enumerate an arbitrary outside directory. The
+  // installed-packages root is the same root the disk-removal `rm` confines to
+  // below, so the read and the delete share one containment contract.
+  const installedPackagesRoot = path.resolve(getInstalledPackagesDir());
+  const resolvedRepositoryPath = existingPackage.repositoryPath
+    ? path.resolve(existingPackage.repositoryPath)
+    : null;
+  const repositoryPathConfined =
+    resolvedRepositoryPath !== null &&
+    resolvedRepositoryPath.startsWith(installedPackagesRoot + path.sep) &&
+    isRealpathContained(resolvedRepositoryPath, installedPackagesRoot);
+  if (repositoryPathConfined && resolvedRepositoryPath) {
+    const agentsDirPath = path.join(resolvedRepositoryPath, "agents");
+    // Leaf confinement: `agents/` lexically lives in the confined repo dir, but
+    // could itself be a symlink to an outside directory that `readdirSync`
+    // would enumerate. Skip when the real `agents/` escapes the real repo dir.
+    if (existsSync(agentsDirPath) && isFileLeafContainedInDir(resolvedRepositoryPath, agentsDirPath)) {
       try {
         agentSlugsForCleanup = readdirSync(agentsDirPath, { withFileTypes: true })
           .filter((entry) => entry.isDirectory())
@@ -1921,13 +2266,14 @@ export async function uninstallSkillPackage(packageId: string) {
     skills: existingCatalog.skills.filter((s) => s.packageId !== packageId),
   });
 
-  // Remove from disk if it lives in the skills data directory.
-  if (existingPackage.repositoryPath) {
-    const resolvedRepoPath = path.resolve(existingPackage.repositoryPath);
-    const resolvedSkillsRoot = path.resolve(getInstalledPackagesDir());
-    if (resolvedRepoPath.startsWith(resolvedSkillsRoot + path.sep)) {
-      await rm(resolvedRepoPath, { recursive: true, force: true });
-    }
+  // Remove from disk if it lives in the skills data directory. Reuse the
+  // single lexical+realpath containment computed for the agents read above
+  // (#300): `repositoryPathConfined` already requires the stored path to be
+  // STRICTLY inside the installed-packages root (root-equality excluded by
+  // `startsWith(root + sep)`) AND realpath-confined, so a symlinked-ancestor
+  // escape can never reach this `rm`.
+  if (repositoryPathConfined && resolvedRepositoryPath) {
+    await rm(resolvedRepositoryPath, { recursive: true, force: true });
   }
 
   // Now remove any level:"agent" rows that were registered for the agent

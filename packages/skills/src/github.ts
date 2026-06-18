@@ -1,5 +1,5 @@
 import { chmod, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
-import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, readdirSync, realpathSync } from "node:fs";
 import path from "node:path";
 import { Octokit } from "octokit";
 import { unzipSync } from "fflate";
@@ -15,7 +15,13 @@ function getGitHubSyncMarkerPath(): string {
 
 function readGitHubSyncMarker(): { repository: string; syncedAt: string } | null {
   const markerPath = getGitHubSyncMarkerPath();
-  if (!existsSync(markerPath)) return null;
+  // Leaf confinement (file-symlink escape, #300). The marker sits at a fixed
+  // leaf under the skills data root, but if that leaf is a SYMLINK to an
+  // outside file the `readFileSync` would follow it and leak arbitrary local
+  // content. Skip (treat as no marker) when the real leaf escapes the real root.
+  const skillsRoot = path.resolve(getSkillsDataRootPath());
+  if (!existsSync(markerPath) || !isEntryContainedInBase(skillsRoot, path.resolve(markerPath)))
+    return null;
   try {
     return JSON.parse(readFileSync(markerPath, "utf8"));
   } catch {
@@ -25,7 +31,24 @@ function readGitHubSyncMarker(): { repository: string; syncedAt: string } | null
 
 async function writeGitHubSyncMarker(repositoryFullName: string): Promise<void> {
   const markerPath = getGitHubSyncMarkerPath();
+  // Leaf confinement (#300). Refuse to write through a symlinked marker leaf
+  // that resolves OUT of the skills data root (a `writeFile` would otherwise
+  // clobber an arbitrary outside file). A legitimate (non-symlink, or
+  // not-yet-created) marker is a no-op for the realpath check.
+  const skillsRoot = path.resolve(getSkillsDataRootPath());
+  if (!isEntryContainedInBase(skillsRoot, path.resolve(markerPath))) {
+    return;
+  }
   await mkdir(path.dirname(markerPath), { recursive: true });
+  // Dangling-write-leaf confinement (#300): the containment check above uses
+  // existsSync (follows symlinks) so a pre-existing DANGLING symlink leaf would
+  // slip through and `writeFile` would create the marker at the outside target.
+  // lstat catches the dangling symlink. The marker is non-critical, so skip the
+  // write (with a log) rather than writing through the symlink.
+  if (!isLeafSafeToWrite(markerPath)) {
+    console.warn(`[skills/github] refusing to write sync marker through symlink leaf: ${markerPath}`);
+    return;
+  }
   await writeFile(markerPath, JSON.stringify({ repository: repositoryFullName, syncedAt: new Date().toISOString() }, null, 2));
 }
 
@@ -36,6 +59,140 @@ export type GitHubRepositoryReference = {
 
 function normalizeRepositoryName(value: string) {
   return value.replace(/\.git$/i, "").trim();
+}
+
+/**
+ * Local fail-closed containment barrier (js/path-injection, code-scanning).
+ *
+ * Resolve a filesystem target and assert it stays inside the fixed skills data
+ * root BEFORE any destructive (`rm`/`mkdir`) or read (`existsSync`/`readdir`/
+ * `readFile`) operation touches it. The install/sync callers already validate
+ * `owner`/`repo` (see `isSafeOwnerAndRepo`, #291), so this never trips for
+ * legitimate input — but the assertion is what CodeQL recognizes as a
+ * flow-breaking sanitizer, and it makes the chokepoints safe regardless of a
+ * future/unvalidated caller (e.g. the recursive `rm` in
+ * `cloneGitHubRepoToDirectory` runs on the function parameter BEFORE the
+ * per-entry containment loop).
+ *
+ * Returns the resolved, confined path so the caller feeds the
+ * sanitizer-normalized value into the sink (which CodeQL tracks as the barrier
+ * output, breaking the tainted flow).
+ */
+/**
+ * Realpath the nearest EXISTING ancestor of `target` (walking up until a path
+ * that exists is found). Used to canonicalize a not-yet-created leaf: realpath
+ * of a missing path throws, so we resolve the deepest ancestor that exists and
+ * treat the remaining (not-yet-created) segments as confined relative to it.
+ * Returns the lexical resolve when no ancestor exists (defensive — the
+ * filesystem root always exists in practice).
+ */
+function realpathNearestExisting(target: string): string {
+  let current = path.resolve(target);
+  // Walk up to the filesystem root; `path.dirname(root) === root`.
+  for (;;) {
+    if (existsSync(current)) {
+      return realpathSync.native(current);
+    }
+    const parent = path.dirname(current);
+    if (parent === current) {
+      return current;
+    }
+    current = parent;
+  }
+}
+
+export function assertWithinSkillsRoot(targetDirectory: string, errorMessage: string): string {
+  const skillsRoot = path.resolve(getSkillsDataRootPath());
+  const resolvedTarget = path.resolve(targetDirectory);
+  // Layer 1 — lexical containment (defense in depth; KEEP). Breaks the CodeQL
+  // tainted flow and rejects pure `..` escapes before any fs access.
+  if (resolvedTarget !== skillsRoot && !resolvedTarget.startsWith(skillsRoot + path.sep)) {
+    throw new Error(errorMessage);
+  }
+  // Layer 2 — realpath containment (#300). A symlinked ANCESTOR under the
+  // skills root passes the lexical prefix check but a downstream fs op would
+  // follow it OUT of the intended root. Canonicalize the root and the target
+  // (or, when the leaf does not exist yet, the nearest existing ancestor —
+  // realpath of a missing leaf throws) and re-assert containment on the real
+  // paths. Behavior is identical for legitimate non-symlink and not-yet-created
+  // paths (realpath is a no-op on those).
+  const realRoot = realpathNearestExisting(skillsRoot);
+  const realTarget = realpathNearestExisting(resolvedTarget);
+  if (realTarget !== realRoot && !realTarget.startsWith(realRoot + path.sep)) {
+    throw new Error(errorMessage);
+  }
+  return resolvedTarget;
+}
+
+/**
+ * Per-entry realpath containment for a materialized path rooted on an
+ * already-confined base directory (#300, ZIP-slip + symlink-escape). Mirrors
+ * `assertWithinSkillsRoot`'s two layers but as a no-throw predicate the
+ * extraction loop uses to SKIP an escaping entry:
+ *   1. Lexical containment — rejects pure `../` traversal baked into a ZIP
+ *      entry name before any fs op (zip-slip).
+ *   2. Realpath containment — a confined base may contain a SYMLINKED ancestor
+ *      (or the entry's own leaf may be a symlink) that resolves OUT of the
+ *      base; canonicalize the base and the entry (nearest-existing-ancestor
+ *      realpath for a not-yet-created leaf) and re-assert on the real paths.
+ * Behavior is identical for legitimate non-symlink, non-traversal entries
+ * (realpath is a no-op on those).
+ */
+function isEntryContainedInBase(baseDirResolved: string, entryResolved: string): boolean {
+  // Layer 1 — lexical.
+  if (
+    entryResolved !== baseDirResolved &&
+    !entryResolved.startsWith(baseDirResolved + path.sep)
+  ) {
+    return false;
+  }
+  // Layer 2 — realpath.
+  const realBase = realpathNearestExisting(baseDirResolved);
+  const realEntry = realpathNearestExisting(entryResolved);
+  return realEntry === realBase || realEntry.startsWith(realBase + path.sep);
+}
+
+/**
+ * Dangling-write-leaf confinement (#300). `isEntryContainedInBase` and the
+ * realpath helpers use `existsSync`, which FOLLOWS symlinks: a leaf that is a
+ * DANGLING symlink (file pre-exists, target does NOT) makes `existsSync` return
+ * false so the realpath checks treat it as a not-yet-created leaf and pass —
+ * then `writeFile` follows the dangling symlink and creates the file at the
+ * OUTSIDE target. `lstatSync` does NOT follow the symlink, catching the dangling
+ * case. Returns `false` (refuse-the-write) when the leaf is a symlink so the
+ * caller skips the non-critical write rather than writing through it; `true`
+ * (proceed) for ENOENT (genuinely new file) or a regular file (the dir is
+ * already realpath-confined). Behavior is identical for legitimate new-file and
+ * regular-file writes.
+ */
+function isLeafSafeToWrite(leafPath: string): boolean {
+  try {
+    return !lstatSync(leafPath).isSymbolicLink();
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      return true; // genuinely new file — safe to create
+    }
+    throw err;
+  }
+}
+
+// GitHub owner (user/org) login charset: alphanumerics and single hyphens.
+// GitHub repository-name charset: alphanumerics plus `.`, `_`, `-`.
+// Neither may be `.`/`..` nor contain a path separator. These guards are the
+// authoritative defense against path traversal: `owner`/`repo` flow verbatim
+// into `path.join(getSkillsDataRootPath(), "workspace", owner, repo)`, so a
+// reference like `../..` (which the legacy `owner/repo` regex accepted as
+// owner=".." repo="..") MUST be rejected here before it can escape the skills
+// store sandbox (js/path-injection, code-scanning).
+const GITHUB_OWNER_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$/;
+const GITHUB_REPO_PATTERN = /^[A-Za-z0-9._-]+$/;
+
+function isSafeOwnerAndRepo(owner: string, repo: string): boolean {
+  if (!GITHUB_OWNER_PATTERN.test(owner)) return false;
+  // Reject `.`/`..` and any traversal/separator chars in the repo segment.
+  if (repo === "." || repo === ".." || !GITHUB_REPO_PATTERN.test(repo)) return false;
+  if (repo.includes("/") || repo.includes("\\")) return false;
+  return true;
 }
 
 function slugify(value: string) {
@@ -54,20 +211,17 @@ export function parseGitHubRepositoryReference(value: string): GitHubRepositoryR
 
   const scpLikeMatch = trimmed.match(/^git@github\.com:([^/]+)\/(.+?)(?:\.git)?$/i);
   if (scpLikeMatch) {
-    return {
-      owner: scpLikeMatch[1]!.trim(),
-      repo: normalizeRepositoryName(scpLikeMatch[2]!),
-    };
+    const owner = scpLikeMatch[1]!.trim();
+    const repo = normalizeRepositoryName(scpLikeMatch[2]!);
+    return isSafeOwnerAndRepo(owner, repo) ? { owner, repo } : null;
   }
 
   if (/^[^/\s]+\/[^/\s]+$/.test(trimmed)) {
-    const [owner, repo] = trimmed.split("/");
-    return owner && repo
-      ? {
-          owner: owner.trim(),
-          repo: normalizeRepositoryName(repo),
-        }
-      : null;
+    const [ownerRaw, repoRaw] = trimmed.split("/");
+    if (!ownerRaw || !repoRaw) return null;
+    const owner = ownerRaw.trim();
+    const repo = normalizeRepositoryName(repoRaw);
+    return isSafeOwnerAndRepo(owner, repo) ? { owner, repo } : null;
   }
 
   try {
@@ -76,13 +230,11 @@ export function parseGitHubRepositoryReference(value: string): GitHubRepositoryR
       return null;
     }
 
-    const [owner, repo] = url.pathname.split("/").filter(Boolean);
-    return owner && repo
-      ? {
-          owner: owner.trim(),
-          repo: normalizeRepositoryName(repo),
-        }
-      : null;
+    const [ownerRaw, repoRaw] = url.pathname.split("/").filter(Boolean);
+    if (!ownerRaw || !repoRaw) return null;
+    const owner = ownerRaw.trim();
+    const repo = normalizeRepositoryName(repoRaw);
+    return isSafeOwnerAndRepo(owner, repo) ? { owner, repo } : null;
   } catch {
     return null;
   }
@@ -190,7 +342,8 @@ async function cloneGitHubRepoToDirectory(input: {
   /** Optional tag / branch / sha. When undefined the repository's default branch is used. */
   ref?: string;
 }) {
-  const { octokit, owner, repo, targetDirectory, ref } = input;
+  const { octokit, owner, repo, ref } = input;
+  let targetDirectory = input.targetDirectory;
 
   const repoResponse = await octokit.rest.repos.get({ owner, repo });
   let treeSha: string;
@@ -212,13 +365,47 @@ async function cloneGitHubRepoToDirectory(input: {
     throw new Error("The selected GitHub repository is too large to sync through the current tree API flow.");
   }
 
+  // Fail-closed local barrier (js/path-injection). The destructive recursive
+  // `rm` below runs on the `targetDirectory` PARAMETER before the per-entry
+  // containment loop, so confine it to the skills data root here regardless of
+  // what the caller passed. Callers already validate `owner`/`repo` (#291); a
+  // legitimate target never trips this. Reassign `targetDirectory` to the
+  // resolved/confined path so CodeQL tracks the sanitizer output into the
+  // `rm`/`mkdir` sinks below (the sink reads the barrier's return value; the
+  // variable name is immaterial to the dataflow).
+  targetDirectory = assertWithinSkillsRoot(
+    targetDirectory,
+    "Refusing to sync: clone target escapes the skills data root.",
+  );
+
   await rm(targetDirectory, { recursive: true, force: true });
   await mkdir(targetDirectory, { recursive: true });
 
+  // Containment root for every materialized tree entry. Defense-in-depth: Git
+  // tree paths cannot themselves contain `..` components (Git rejects them in
+  // tree objects), but we never write a path that resolves outside the clone
+  // target regardless of what the API returns (js/path-injection).
+  // `targetDirectory` is the confined base asserted above.
   for (const entry of treeResponse.data.tree) {
     if (!entry.path) continue;
 
+    // Build the destination from the confined `targetDirectory` base (the
+    // barrier output asserted above), then re-confirm the resolved entry stays
+    // inside it. This is the #291 per-entry pattern; rooting it on the
+    // sanitizer output makes the mkdir/writeFile/chmod sinks below tracked as
+    // confined (js/path-injection).
     const destinationPath = path.join(targetDirectory, entry.path);
+    // Per-entry realpath containment (#300), mirroring the ZIP-install loop's
+    // `isEntryContainedInBase`. Git tree paths cannot contain `..`, but a tree
+    // CAN carry a symlink blob (mode 120000) pointing outside; an earlier
+    // symlink entry would then let a later `mkdir`/`writeFile` traverse OUT of
+    // the confined clone target. Resolve each entry against the confined base
+    // and SKIP on escape (lexical `..` + realpath symlink). Behavior is
+    // identical for legitimate non-symlink, non-traversal trees.
+    if (!isEntryContainedInBase(targetDirectory, path.resolve(destinationPath))) {
+      // Skip any entry that would escape the clone target.
+      continue;
+    }
 
     if (entry.type === "tree") {
       await mkdir(destinationPath, { recursive: true });
@@ -344,11 +531,14 @@ export async function installSkillPackageFromGitHub(
   // workspace-tier installs; they land at workspace/<owner>/<repo>/.
   // `getSkillsDataRootPath()` honors config + worktree isolation, and the
   // workspace scope prevents top-level package layouts from being created.
-  const targetDirectory = path.join(
-    getSkillsDataRootPath(),
-    "workspace",
-    repository.owner,
-    repository.repo,
+  const targetDirectory = assertWithinSkillsRoot(
+    path.join(
+      getSkillsDataRootPath(),
+      "workspace",
+      repository.owner,
+      repository.repo,
+    ),
+    `Refusing to install ${packageId}: resolved target escapes the skills data root.`,
   );
 
   // Clobber guard. slugify() can produce a collision when two repositories
@@ -367,7 +557,17 @@ export async function installSkillPackageFromGitHub(
   if (targetDirIsNonEmpty) {
     let recordedPackageId: string | null = null;
     let markerIsValid = false;
-    if (existsSync(installMarkerPath)) {
+    // Leaf confinement (file-symlink escape, #300). `targetDirectory` is the
+    // realpath-confined install base, but `.cinatra-skill-source.json` inside
+    // it could be a SYMLINK to an outside file the `readFileSync` below would
+    // follow (leaking arbitrary local content into the provenance check, and
+    // letting an attacker forge a "matching" marker from outside). Skip the
+    // read when the real marker escapes the real base — treated as a missing
+    // marker, which fails closed into the "no provenance marker" refusal.
+    if (
+      existsSync(installMarkerPath) &&
+      isEntryContainedInBase(path.resolve(targetDirectory), path.resolve(installMarkerPath))
+    ) {
       try {
         const marker = JSON.parse(readFileSync(installMarkerPath, "utf8")) as { packageId?: unknown };
         if (typeof marker.packageId === "string" && marker.packageId.length > 0) {
@@ -401,6 +601,22 @@ export async function installSkillPackageFromGitHub(
   });
 
   // Drop a fresh marker that future installs use for the collision check.
+  // Write-LEAF confinement (#300), mirroring the read-side check above. The
+  // clone wiped+rebuilt `targetDirectory`, but a tree entry named
+  // `.cinatra-skill-source.json` could have materialized the marker leaf as a
+  // SYMLINK (the per-entry guard only confines its REAL target inside the base,
+  // it does not forbid an in-base symlink), and `writeFile` would then follow
+  // that link. Refuse to write through a marker leaf whose real path escapes the
+  // install base. A non-symlink / not-yet-created marker is a no-op for the
+  // realpath check, so behavior is identical for legitimate installs.
+  if (
+    existsSync(installMarkerPath) &&
+    !isEntryContainedInBase(path.resolve(targetDirectory), path.resolve(installMarkerPath))
+  ) {
+    throw new Error(
+      `Refusing to write the install marker for ${packageId}: marker leaf escapes the install target via symlink.`,
+    );
+  }
   await writeFile(
     installMarkerPath,
     JSON.stringify({ packageId, repository: packageName, ref: ref ?? null, installedAt: new Date().toISOString() }, null, 2),
@@ -514,11 +730,19 @@ export async function installSkillPackageFromZip(zipBuffer: Buffer, slug: string
   const packageId = `zip:${packageSlug}`;
   // Target the ownership-first layout. ZIP-uploaded packages are workspace-tier
   // user-authored installs; they land at workspace/uploaded/<slug>/.
-  const targetDirectory = path.join(
-    getSkillsDataRootPath(),
-    "workspace",
-    "uploaded",
-    packageSlug,
+  // Fail-closed base confinement (#300). Confine the install base to the
+  // skills data root BEFORE the destructive `rm`/`mkdir` and per-entry writes.
+  // The slug is slugified, so a legitimate upload never trips this; a symlinked
+  // ancestor under workspace/uploaded that resolves the base outside the root
+  // is rejected here. Reassign so the sanitizer output feeds the sinks below.
+  const targetDirectory = assertWithinSkillsRoot(
+    path.join(
+      getSkillsDataRootPath(),
+      "workspace",
+      "uploaded",
+      packageSlug,
+    ),
+    `Refusing to install ${packageId}: resolved target escapes the skills data root.`,
   );
 
   await rm(targetDirectory, { recursive: true, force: true });
@@ -534,11 +758,20 @@ export async function installSkillPackageFromZip(zipBuffer: Buffer, slug: string
     ? allPaths[0]!.slice(0, firstSlash + 1)
     : "";
 
+  // The extraction base for the per-entry zip-slip check is the confined target.
+  const resolvedTarget = path.resolve(targetDirectory);
   for (const [zipPath, content] of Object.entries(unzipped)) {
     const relativePath = rootPrefix ? zipPath.slice(rootPrefix.length) : zipPath;
     if (!relativePath) continue; // root directory entry
 
+    // ZIP-SLIP / symlink-escape (#300). Resolve each entry against the confined
+    // base and SKIP any entry whose resolved real path escapes it — covers a
+    // `../` lexical traversal baked into the entry name AND a symlinked
+    // ancestor/leaf already materialized inside the base by an earlier entry.
     const destinationPath = path.join(targetDirectory, relativePath);
+    if (!isEntryContainedInBase(resolvedTarget, path.resolve(destinationPath))) {
+      continue;
+    }
     if (zipPath.endsWith("/")) {
       await mkdir(destinationPath, { recursive: true });
     } else {
@@ -606,7 +839,16 @@ export async function pushSkillStoreToGitHub(options?: { force?: boolean }): Pro
   // Create blobs for all files
   const treeItems: Array<{ path: string; mode: "100644"; type: "blob"; sha: string }> = [];
 
+  const resolvedStoreRoot = path.resolve(storeRoot);
   for (const file of files) {
+    // Leaf confinement (file-symlink escape, #300). `collectFilesRecursive`
+    // walks `storeRoot`, but a file leaf under it that is a SYMLINK to an
+    // outside secret would be followed by the `readFile` below and pushed to
+    // the remote repo. Skip any file whose real path escapes the real store
+    // root (`continue` matches the loop's per-file, non-fatal handling).
+    if (!isEntryContainedInBase(resolvedStoreRoot, path.resolve(file.absolutePath))) {
+      continue;
+    }
     const content = await readFile(file.absolutePath);
     const blobResponse = await octokit.rest.git.createBlob({
       owner,
