@@ -71,6 +71,42 @@ function humanizePathSegment(segment: string) {
     .replace(/\b\w/g, (char) => char.toUpperCase());
 }
 
+// Configuration grouping segments that exist only as routing containers — no
+// `page.tsx` at `/configuration/<seg>`, so a breadcrumb link there 404s.
+const PAGELESS_CONFIG_GROUPS = new Set([
+  "agents",
+  "a2a",
+  "instance",
+  "network",
+  "operations",
+]);
+
+// Whether the breadcrumb crumb for `segments[i]` points at a pageless routing
+// container that would 404 if linked — in which case it must render as a plain
+// label, not a link. The auto-breadcrumb otherwise turns every ancestor segment
+// into `/seg0/.../segi`, but App-Router container segments (dynamic params with
+// no own page, grouping folders) have no page to land on.
+//
+// Keep this in sync with the route tree — a segment belongs here when its
+// directory under `src/app` has no `page.tsx`. Known cases:
+//   • /connectors/[vendor] and /connectors/[vendor]/[slug] — connectors resolve
+//     only at /connectors/[vendor]/[slug]/[subroute]; the vendor and connector
+//     levels have no index page. (Making the connector level a real link to its
+//     canonical subroute is a tracked follow-up.)
+//   • /configuration/<group> for the grouping segments above.
+function isPagelessContainerCrumb(segments: string[], i: number): boolean {
+  const depth = i + 1; // number of path segments up to and including this crumb
+  if (segments[0] === "connectors" && (depth === 2 || depth === 3)) return true;
+  if (
+    segments[0] === "configuration" &&
+    depth === 2 &&
+    PAGELESS_CONFIG_GROUPS.has(segments[1])
+  ) {
+    return true;
+  }
+  return false;
+}
+
 function deriveDocumentTitle(pathname: string, explicitTitle?: string) {
   if (explicitTitle) {
     return `${explicitTitle} | Cinatra`;
@@ -281,7 +317,7 @@ export function AppShell({
   }, [pathname]);
 
   const breadcrumbSegments = useMemo<
-    { label: string; href: string; ellipsis?: boolean }[]
+    { label: string; href: string; ellipsis?: boolean; nonNavigable?: boolean }[]
   >(() => {
     const segments = pathname.split("/").filter(Boolean);
     if (segments.length === 0) return [{ label: "Personal", href: "/personal" }];
@@ -319,7 +355,13 @@ export function AppShell({
         isLast && pageTitle && pageTitle.pathname === pathname
           ? pageTitle.title
           : humanizePathSegment(seg);
-      return { label, href: "/" + segments.slice(0, i + 1).join("/") };
+      return {
+        label,
+        href: "/" + segments.slice(0, i + 1).join("/"),
+        // Intermediate segments whose path is a pageless routing container
+        // (e.g. /connectors/[vendor]) would 404 if linked — render as a label.
+        nonNavigable: !isLast && isPagelessContainerCrumb(segments, i),
+      };
     });
 
     // Breadcrumb: 3-4 crumbs max; truncate the middle with an ellipsis.
@@ -510,6 +552,10 @@ export function AppShell({
                         <BreadcrumbEllipsis />
                       ) : i === breadcrumbSegments.length - 1 ? (
                         <BreadcrumbPage>{crumb.label}</BreadcrumbPage>
+                      ) : crumb.nonNavigable ? (
+                        <span className="font-normal text-muted-foreground">
+                          {crumb.label}
+                        </span>
                       ) : (
                         <BreadcrumbLink asChild>
                           <Link href={crumb.href}>{crumb.label}</Link>
