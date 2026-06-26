@@ -3227,15 +3227,7 @@ async function handleAgentBuilderGitWriteFiles(
     packageSlug,
 );
 
-  // new canonical layout: <installDir>/<vendor>/<slug>/
-  // Use the SAME `vendorName` the package-name rescoping above derived (it
-  // defaults to "cinatra-ai" only when the instance identity is empty), so
-  // the on-disk vendor dir, the rescoped package.json#name, and the published
-  // scope can never drift apart. Previously this was hardcoded to
-  // "cinatra-ai", so an operator-vendor agent (e.g. "@acme/<slug>") was
-  // written under extensions/cinatra-ai/<slug> while its package.json#name
-  // said "@acme/..." — a path/scope mismatch that polluted the first-party
-  // namespace and split the agent's identity (cinatra#537).
+  // canonical layout <installDir>/<vendor>/<slug>/ — reuse derived `vendorName` so dir, package.json#name, and published scope can't drift (cinatra#537).
   const installRoot = resolveAgentInstallDir();
   const agentRoot = join(installRoot, vendorName, packageSlug);
   const packageJsonPath = join(agentRoot, "package.json");
