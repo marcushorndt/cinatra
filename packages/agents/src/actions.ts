@@ -24,7 +24,8 @@ import { actorFromSession, type ActorRoleHints } from "@/lib/authz/build-actor-c
 import type { ResourceForAccessCheck } from "@/lib/authz/enforce-resource-access";
 import { readProjectById } from "@/lib/projects-store-dao";
 import { readProjectCoOwners } from "@/lib/project-co-owners-store";
-import { readTeamForOrg } from "@/lib/better-auth-db";
+import { readTeamForOrg, countOtherPlatformAdmins } from "@/lib/better-auth-db";
+import { readConnectorConfigFromDatabase } from "@/lib/database";
 import { buildAgentWorkspacePath } from "@/lib/agent-url";
 import { enqueueAgentRun } from "@/lib/agent-run-enqueue";
 import { approveReviewTaskInternal } from "./review-task-actions";
@@ -34,6 +35,7 @@ import {
   readAgentTemplateById,
   readAgentTemplateByPackageName,
   readAgentRunById,
+  readAgentRunByTaskId,
   readAgentVersionsByTemplate,
   readAgentVersionById,
   createAgentTemplate,
@@ -133,6 +135,44 @@ function getActiveOrganizationId(session: SessionWithActiveOrganization): string
   return session.session?.activeOrganizationId ?? undefined;
 }
 
+// Run self-approval config (admin-overridable). Run-side analog of the
+// agent-creation `agent_creation.allowSelfApproval` override (see
+// mcp/agent-creation-request-handlers.ts). Stored under its OWN connector_config
+// key — runs and agent-creation are distinct concerns, so they must not share
+// one toggle. When true, the reviewer self-approval guard in approveReviewTask
+// is disabled instance-wide even on multi-admin instances.
+const RUN_SELF_APPROVAL_CONFIG_KEY = "agent_run";
+type AgentRunConfig = { allowSelfApproval?: boolean };
+function readAllowRunSelfApproval(): boolean {
+  try {
+    const cfg = readConnectorConfigFromDatabase<AgentRunConfig>(RUN_SELF_APPROVAL_CONFIG_KEY, {});
+    return cfg.allowSelfApproval === true;
+  } catch {
+    return false;
+  }
+}
+
+// Resolve the agent_run backing a synthetic approval task id so the
+// self-approval guard can read run.runBy. Mirrors the run-resolution the
+// approveReviewTaskInternal branches do for the two supported synthetic
+// prefixes:
+//   - "setup-{runId}"    -> readAgentRunById(runId)
+//   - "wayflow-{taskId}" -> readAgentRunByTaskId(taskId)
+// Returns null for an unknown prefix / missing row; the guard then falls
+// through (the SoD guard cannot bind to an absent run, and the downstream
+// helper raises the canonical not-found error).
+async function resolveRunForApprovalTask(
+  taskId: string,
+): Promise<{ runBy: string | null } | null> {
+  if (taskId.startsWith("setup-")) {
+    return readAgentRunById(taskId.slice("setup-".length));
+  }
+  if (taskId.startsWith("wayflow-")) {
+    return readAgentRunByTaskId(taskId.slice("wayflow-".length));
+  }
+  return null;
+}
+
 // approveReviewTask
 
 export async function approveReviewTask(
@@ -154,7 +194,46 @@ export async function approveReviewTask(
   // `fieldName` is forwarded so setup paths can bypass the provenance read.
   // Default undefined preserves back-compat for all current callers.
   const session = await requireAdminSession();
-  await approveReviewTaskInternal(taskId, session.user.id, values, fieldName, schemaSnapshot);
+  const userId = session.user.id;
+
+  // Run-side self-approval guard (issue #563) — the run analog of the
+  // agent-creation decide self-approval guard
+  // (mcp/agent-creation-request-handlers.ts). This is the UI admin approval
+  // path (the operator clicking Continue/Approve on a pending_approval run),
+  // mirroring how the agent-creation guard lives in the admin decide handler —
+  // NOT in the auth-neutral approveReviewTaskInternal helper (the A2A
+  // service-account self-resume path stays unaffected, exactly as the creation
+  // guard leaves the admin-authoring instant-grant path unaffected).
+  //
+  // Separation of duties: an admin who initiated a run must not rubber-stamp
+  // their own run's HITL gate when ANOTHER platform_admin exists who could
+  // review it instead.
+  //
+  // Single-admin exception (issue #563, run-side analog of #382/#392 /
+  // PR #557): on an instance where the approving admin is the ONLY
+  // platform_admin, there is no second reviewer who could ever clear the gate,
+  // so an unconditional guard would be a permanent deadlock — the run sits in
+  // pending_approval forever. When no OTHER platform_admin exists, SoD is
+  // impossible and the sole admin is allowed to approve their own run. The
+  // agent_run.allowSelfApproval connector_config override remains a global
+  // escape hatch for instances that want self-approval even with multiple
+  // admins. countOtherPlatformAdmins fails CLOSED (returns >=1 on a read
+  // error), so an error keeps the guard on.
+  if (!readAllowRunSelfApproval()) {
+    const run = await resolveRunForApprovalTask(taskId);
+    if (run && run.runBy != null && run.runBy === userId) {
+      const otherAdmins = await countOtherPlatformAdmins(userId);
+      if (otherAdmins > 0) {
+        throw new Error(
+          "self-approval is disallowed: another platform admin must approve a run you initiated " +
+            "(set connector_config.agent_run.allowSelfApproval=true to override).",
+        );
+      }
+      // No other admin can review → fall through and allow the self-approval.
+    }
+  }
+
+  await approveReviewTaskInternal(taskId, userId, values, fieldName, schemaSnapshot);
 }
 
 // rejectReviewTask
