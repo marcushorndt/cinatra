@@ -17,7 +17,12 @@
 //   - wayflow- prefix resolves the run via readAgentRunByTaskId for the same guard;
 //   - wayflow- prefix with a STALE a2a_task_id column falls back to the Redis
 //     reverse-map (resolveRunIdByWayflowTaskId) so the guard still binds runBy and
-//     blocks self-approval — parity with the resume path (approveReviewTaskInternal).
+//     blocks self-approval — parity with the resume path (approveReviewTaskInternal);
+//   - wayflow- prefix where BOTH the column and the reverse-map miss -> FAIL CLOSED
+//     (reject, no resume): the helper re-resolves both sources independently and
+//     could still recover+resume, so an unresolved guard must not fall through (TOCTOU);
+//   - the allowSelfApproval override skips the whole guard, so it bypasses even the
+//     fail-closed reject (SoD globally disabled).
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -260,17 +265,37 @@ describe("approveReviewTask — run-side self-approval guard (#563)", () => {
     expect(approveReviewTaskInternalMock).toHaveBeenCalledTimes(1);
   });
 
-  it("falls through (no guard) for wayflow- when both the column and reverse-map miss", async () => {
-    // Neither the a2a_task_id column nor the Redis reverse-map resolves a run.
-    // The guard cannot bind, never consults the admin count, and hands off to
-    // the internal helper which raises the canonical not-found error.
+  it("FAILS CLOSED for wayflow- when both the column and reverse-map miss (TOCTOU guard)", async () => {
+    // Neither the a2a_task_id column nor the Redis reverse-map resolves a run at
+    // CHECK time. But approveReviewTaskInternal re-resolves BOTH sources
+    // independently at USE time and could recover + resume the run — a TOCTOU
+    // variant of the SoD bypass. The guard never saw run.runBy, so it cannot
+    // prove the resume is SoD-safe and MUST reject (no resume), not fall through.
     readAgentRunByTaskIdMock.mockResolvedValue(null);
     resolveRunIdByWayflowTaskIdMock.mockResolvedValue(null);
     countOtherPlatformAdminsMock.mockResolvedValue(9);
 
+    await expect(approveReviewTask("wayflow-task-9")).rejects.toThrow(/could not be resolved/);
+
+    // Both dual-source lookups were attempted, and NO resume happened.
+    expect(readAgentRunByTaskIdMock).toHaveBeenCalledWith("task-9");
+    expect(resolveRunIdByWayflowTaskIdMock).toHaveBeenCalledWith("task-9");
+    expect(approveReviewTaskInternalMock).not.toHaveBeenCalled();
+  });
+
+  it("allowSelfApproval override bypasses the fail-closed reject for an unresolved wayflow- task", async () => {
+    // With SoD globally disabled the guard does not run at all, so an unresolved
+    // wayflow- task is NOT rejected — it hands straight to the helper (which owns
+    // the canonical not-found error). The fail-closed path must not over-apply.
+    readConnectorConfigMock.mockReturnValue({ allowSelfApproval: true });
+    readAgentRunByTaskIdMock.mockResolvedValue(null);
+    resolveRunIdByWayflowTaskIdMock.mockResolvedValue(null);
+
     await expect(approveReviewTask("wayflow-task-9")).resolves.toBeUndefined();
 
-    expect(readAgentRunByIdMock).not.toHaveBeenCalled();
+    // Guard skipped entirely: no resolution work, no admin-count read, resume runs.
+    expect(readAgentRunByTaskIdMock).not.toHaveBeenCalled();
+    expect(resolveRunIdByWayflowTaskIdMock).not.toHaveBeenCalled();
     expect(countOtherPlatformAdminsMock).not.toHaveBeenCalled();
     expect(approveReviewTaskInternalMock).toHaveBeenCalledTimes(1);
   });

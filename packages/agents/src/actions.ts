@@ -165,19 +165,36 @@ function readAllowRunSelfApproval(): boolean {
 // resolves null on the stale-column race while the downstream helper still
 // recovers and resumes the self-owned run, bypassing the multi-admin
 // separation-of-duties block (#563).
-// Returns null for an unknown prefix / missing row; the guard then falls
-// through (the SoD guard cannot bind to an absent run, and the downstream
-// helper raises the canonical not-found error).
+//
+// The result is a DISCRIMINATED outcome, not a bare run-or-null, because the two
+// prefixes have different fail-safety contracts (this closes the TOCTOU the
+// helper's independent re-resolution creates):
+//   - kind: "resolved"  -> run found; the guard evaluates SoD against run.runBy.
+//   - kind: "not-found" -> the SINGLE-source prefix (setup-) found no row. There
+//       is exactly one resolution (readAgentRunById) shared with the helper, so
+//       the guard and helper cannot disagree; the guard falls through and the
+//       helper raises the canonical not-found error.
+//   - kind: "unresolved-resumable" -> the DUAL-source wayflow- prefix could not
+//       resolve a run from EITHER the a2a_task_id column or the Redis reverse-map
+//       AT CHECK TIME, but the helper re-resolves both sources independently at
+//       USE time and may then recover + resume the run. The guard therefore
+//       cannot prove the resume is SoD-safe, so the caller MUST fail CLOSED.
+type ApprovalRunResolution =
+  | { kind: "resolved"; runBy: string | null }
+  | { kind: "not-found" }
+  | { kind: "unresolved-resumable" };
+
 async function resolveRunForApprovalTask(
   taskId: string,
-): Promise<{ runBy: string | null } | null> {
+): Promise<ApprovalRunResolution> {
   if (taskId.startsWith("setup-")) {
-    return readAgentRunById(taskId.slice("setup-".length));
+    const run = await readAgentRunById(taskId.slice("setup-".length));
+    return run ? { kind: "resolved", runBy: run.runBy } : { kind: "not-found" };
   }
   if (taskId.startsWith("wayflow-")) {
     const wayflowTaskId = taskId.slice("wayflow-".length);
     const run = await readAgentRunByTaskId(wayflowTaskId);
-    if (run) return run;
+    if (run) return { kind: "resolved", runBy: run.runBy };
 
     // a2a_task_id column lost the per-gate update race (see
     // review-task-actions.ts wayflow- branch). Fall back to the authoritative
@@ -187,9 +204,15 @@ async function resolveRunForApprovalTask(
     // @cinatra-ai/a2a).
     const { resolveRunIdByWayflowTaskId } = await import("@cinatra-ai/a2a");
     const fallbackRunId = await resolveRunIdByWayflowTaskId(wayflowTaskId);
-    return fallbackRunId ? readAgentRunById(fallbackRunId) : null;
+    if (fallbackRunId) {
+      const fallbackRun = await readAgentRunById(fallbackRunId);
+      if (fallbackRun) return { kind: "resolved", runBy: fallbackRun.runBy };
+    }
+    // Both wayflow- sources missed here, but the helper will re-resolve them
+    // independently and could still resume. Fail closed.
+    return { kind: "unresolved-resumable" };
   }
-  return null;
+  return { kind: "not-found" };
 }
 
 // approveReviewTask
@@ -239,8 +262,20 @@ export async function approveReviewTask(
   // admins. countOtherPlatformAdmins fails CLOSED (returns >=1 on a read
   // error), so an error keeps the guard on.
   if (!readAllowRunSelfApproval()) {
-    const run = await resolveRunForApprovalTask(taskId);
-    if (run && run.runBy != null && run.runBy === userId) {
+    const resolution = await resolveRunForApprovalTask(taskId);
+    if (resolution.kind === "unresolved-resumable") {
+      // Dual-source wayflow- resolution missed at check time, but
+      // approveReviewTaskInternal re-resolves the column AND the Redis
+      // reverse-map independently at use time and could still recover + resume
+      // the run. The guard cannot prove that resume is SoD-safe (it never saw
+      // run.runBy), so allowing it would reopen the multi-admin self-approval
+      // bypass via a TOCTOU window. Fail CLOSED. (#563)
+      throw new Error(
+        "approval rejected: the run for this WayFlow task could not be resolved for the " +
+          "separation-of-duties check; retry once the run's task mapping is consistent.",
+      );
+    }
+    if (resolution.kind === "resolved" && resolution.runBy != null && resolution.runBy === userId) {
       const otherAdmins = await countOtherPlatformAdmins(userId);
       if (otherAdmins > 0) {
         throw new Error(
@@ -250,6 +285,9 @@ export async function approveReviewTask(
       }
       // No other admin can review → fall through and allow the self-approval.
     }
+    // kind === "not-found": single-source (setup-) prefix or unknown prefix
+    // resolved no row. There is no dual-resolution TOCTOU here, so fall through;
+    // approveReviewTaskInternal raises the canonical not-found error.
   }
 
   await approveReviewTaskInternal(taskId, userId, values, fieldName, schemaSnapshot);
