@@ -157,7 +157,14 @@ function readAllowRunSelfApproval(): boolean {
 // approveReviewTaskInternal branches do for the two supported synthetic
 // prefixes:
 //   - "setup-{runId}"    -> readAgentRunById(runId)
-//   - "wayflow-{taskId}" -> readAgentRunByTaskId(taskId)
+//   - "wayflow-{taskId}" -> readAgentRunByTaskId(taskId), with the SAME
+//                           Redis reverse-map fallback the resume path uses
+//                           when agent_runs.a2a_task_id is stale.
+// The wayflow- fallback MUST stay identical to the resolution in
+// approveReviewTaskInternal (review-task-actions.ts) — otherwise the SoD guard
+// resolves null on the stale-column race while the downstream helper still
+// recovers and resumes the self-owned run, bypassing the multi-admin
+// separation-of-duties block (#563).
 // Returns null for an unknown prefix / missing row; the guard then falls
 // through (the SoD guard cannot bind to an absent run, and the downstream
 // helper raises the canonical not-found error).
@@ -168,7 +175,19 @@ async function resolveRunForApprovalTask(
     return readAgentRunById(taskId.slice("setup-".length));
   }
   if (taskId.startsWith("wayflow-")) {
-    return readAgentRunByTaskId(taskId.slice("wayflow-".length));
+    const wayflowTaskId = taskId.slice("wayflow-".length);
+    const run = await readAgentRunByTaskId(wayflowTaskId);
+    if (run) return run;
+
+    // a2a_task_id column lost the per-gate update race (see
+    // review-task-actions.ts wayflow- branch). Fall back to the authoritative
+    // Redis task->run reverse-map so the SoD guard sees the same run the resume
+    // path would recover. Dynamic import mirrors the resume path's
+    // circular-dep avoidance (review-task-actions <- actions <- index <-
+    // @cinatra-ai/a2a).
+    const { resolveRunIdByWayflowTaskId } = await import("@cinatra-ai/a2a");
+    const fallbackRunId = await resolveRunIdByWayflowTaskId(wayflowTaskId);
+    return fallbackRunId ? readAgentRunById(fallbackRunId) : null;
   }
   return null;
 }

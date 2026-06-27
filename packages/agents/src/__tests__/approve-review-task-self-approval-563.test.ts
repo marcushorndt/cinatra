@@ -14,7 +14,10 @@
 //     with other admins (this is the SoD-honoring path, not self-approval);
 //   - connector_config.agent_run.allowSelfApproval=true -> ALLOW even with other
 //     admins (global escape hatch);
-//   - wayflow- prefix resolves the run via readAgentRunByTaskId for the same guard.
+//   - wayflow- prefix resolves the run via readAgentRunByTaskId for the same guard;
+//   - wayflow- prefix with a STALE a2a_task_id column falls back to the Redis
+//     reverse-map (resolveRunIdByWayflowTaskId) so the guard still binds runBy and
+//     blocks self-approval — parity with the resume path (approveReviewTaskInternal).
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -136,6 +139,16 @@ vi.mock("../review-task-actions", () => ({
   approveReviewTaskInternal: approveReviewTaskInternalMock,
 }));
 
+// Redis reverse-map used by the wayflow- stale-column fallback. The guard
+// resolves it via a dynamic `import("@cinatra-ai/a2a")`, so mock that here to
+// keep the resolution identical to the resume path (approveReviewTaskInternal).
+const { resolveRunIdByWayflowTaskIdMock } = vi.hoisted(() => ({
+  resolveRunIdByWayflowTaskIdMock: vi.fn(async () => null as string | null),
+}));
+vi.mock("@cinatra-ai/a2a", () => ({
+  resolveRunIdByWayflowTaskId: resolveRunIdByWayflowTaskIdMock,
+}));
+
 import { approveReviewTask } from "../actions";
 
 beforeEach(() => {
@@ -144,6 +157,7 @@ beforeEach(() => {
   countOtherPlatformAdminsMock.mockResolvedValue(0);
   readConnectorConfigMock.mockReturnValue({});
   approveReviewTaskInternalMock.mockResolvedValue(undefined);
+  resolveRunIdByWayflowTaskIdMock.mockResolvedValue(null);
 });
 
 afterEach(() => {
@@ -211,6 +225,54 @@ describe("approveReviewTask — run-side self-approval guard (#563)", () => {
 
     expect(readAgentRunByTaskIdMock).toHaveBeenCalledWith("task-9");
     expect(approveReviewTaskInternalMock).not.toHaveBeenCalled();
+  });
+
+  it("blocks wayflow- self-approval via the Redis reverse-map when a2a_task_id is STALE (resume-path parity)", async () => {
+    // Stale-column race: the direct lookup misses, exactly like the resume path
+    // in approveReviewTaskInternal. The guard MUST fall back to the Redis
+    // reverse-map and still bind run.runBy — otherwise a sole-runBy admin could
+    // bypass the multi-admin SoD block by riding the stale column.
+    readAgentRunByTaskIdMock.mockResolvedValue(null);
+    resolveRunIdByWayflowTaskIdMock.mockResolvedValue("run-w");
+    readAgentRunByIdMock.mockResolvedValue({ id: "run-w", runBy: "admin-1" });
+    countOtherPlatformAdminsMock.mockResolvedValue(2);
+
+    await expect(approveReviewTask("wayflow-task-9")).rejects.toThrow(/self-approval is disallowed/);
+
+    // Direct column lookup tried first, then the authoritative reverse-map,
+    // then the run is read by the recovered id — identical to the resume path.
+    expect(readAgentRunByTaskIdMock).toHaveBeenCalledWith("task-9");
+    expect(resolveRunIdByWayflowTaskIdMock).toHaveBeenCalledWith("task-9");
+    expect(readAgentRunByIdMock).toHaveBeenCalledWith("run-w");
+    expect(approveReviewTaskInternalMock).not.toHaveBeenCalled();
+  });
+
+  it("ALLOWS sole-admin wayflow- self-approval even when a2a_task_id is STALE (single-admin unblock preserved)", async () => {
+    // Same stale-column recovery, but the approving admin is the ONLY
+    // platform_admin -> no deadlock-avoidance unblock must still resume.
+    readAgentRunByTaskIdMock.mockResolvedValue(null);
+    resolveRunIdByWayflowTaskIdMock.mockResolvedValue("run-w");
+    readAgentRunByIdMock.mockResolvedValue({ id: "run-w", runBy: "admin-1" });
+    countOtherPlatformAdminsMock.mockResolvedValue(0);
+
+    await expect(approveReviewTask("wayflow-task-9")).resolves.toBeUndefined();
+
+    expect(approveReviewTaskInternalMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("falls through (no guard) for wayflow- when both the column and reverse-map miss", async () => {
+    // Neither the a2a_task_id column nor the Redis reverse-map resolves a run.
+    // The guard cannot bind, never consults the admin count, and hands off to
+    // the internal helper which raises the canonical not-found error.
+    readAgentRunByTaskIdMock.mockResolvedValue(null);
+    resolveRunIdByWayflowTaskIdMock.mockResolvedValue(null);
+    countOtherPlatformAdminsMock.mockResolvedValue(9);
+
+    await expect(approveReviewTask("wayflow-task-9")).resolves.toBeUndefined();
+
+    expect(readAgentRunByIdMock).not.toHaveBeenCalled();
+    expect(countOtherPlatformAdminsMock).not.toHaveBeenCalled();
+    expect(approveReviewTaskInternalMock).toHaveBeenCalledTimes(1);
   });
 
   it("falls through (no guard) when the run cannot be resolved — downstream helper owns the not-found error", async () => {
