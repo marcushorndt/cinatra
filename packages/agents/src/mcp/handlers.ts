@@ -60,6 +60,16 @@ import { readdir, readFile, writeFile, mkdir, rm } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { dirname, join, relative, sep } from "node:path";
 import { resolveAgentInstallDir } from "../agent-install-path";
+// Agent-source on-disk path resolution + vendor-segment derivation (extracted
+// from this file to stay under the file-size ratchet; cinatra#537 path-safety).
+import {
+  LEGACY_SLUG_MAP,
+  resolveInstanceVendorSegment,
+  safeVendorSegmentsForRead,
+  resolveAgentJsonPathForRead,
+  resolveAgentRootDirForRead,
+  resolveAgentJsonPathForWrite,
+} from "./agent-source-paths";
 import { createZipBuffer } from "../zip-helpers";
 import { AGENT_TEMPLATE_TYPE_ID } from "../agent-builder-ids";
 // read the chat-side projectContext frame
@@ -114,6 +124,8 @@ import { triggerWayflowReload, type ReloadResult } from "../wayflow-reload-clien
 import {
   listAgentPackages,
   InstanceNamespaceNotConfiguredError,
+  isSafePathSegment,
+  assertSafePathSegment,
   type VerdaccioConfig,
 } from "@cinatra-ai/registries";
 import {
@@ -2588,83 +2600,12 @@ async function handleAgentBuilderVersionDiff(
 }
 
 // ---------------------------------------------------------------------------
-// 4-rung agent definition path resolution.
-// New canonical layout: <installDir>/cinatra/<slug>-agent/cinatra/oas.json
-// the resolver introduces a 4-rung probe so legacy installs still resolve
-// while we migrate forward:
-//   1. <installDir>/cinatra/<slug>/cinatra/oas.json    — NEW canonical
-//   2. <installDir>/cinatra/<slug>/cinatra/agent.json  — transitional (same dir, old filename)
-//   3. <installDir>/<legacySlug>/cinatra/agent.json    — legacy
-//   4. <installDir>/<legacySlug>/agent.json            — legacy (older layout)
-// LEGACY_SLUG_MAP handles the two slugs whose legacy directory names differed from the slug.
+// 4-rung agent definition path resolution + vendor-segment derivation.
+// Definitions live in ./agent-source-paths (extracted to keep this file under
+// the file-size ratchet; behavior is identical). The path-safety guard CALLS
+// remain at every join site BELOW in this file — only the helper definitions
+// moved. See that module for the full layout/rung documentation.
 // ---------------------------------------------------------------------------
-
-const LEGACY_SLUG_MAP: Record<string, string> = {
-  "drupal-agent": "drupal-content-editor",
-  "wordpress-agent": "wordpress-content-editor",
-};
-
-function resolveAgentJsonPathForRead(packageSlug: string): {
-  path: string;
-  relPath: string;
-  /** Agent package root dir (parent of cinatra/ for rungs 1–3; the file's own
-   *  dir for the flat rung-4 layout). Sibling reads (package.json, LICENSE,
-   *  skills/) resolve against this so they cannot disagree with `path`. */
-  rootDir: string;
-} | null {
-  const root = resolveAgentInstallDir();
-  // Rung 1 — NEW canonical
-  const newRoot = join(root, "cinatra-ai", packageSlug);
-  const rung1 = join(newRoot, "cinatra", "oas.json");
-  if (existsSync(rung1)) return { path: rung1, relPath: relative(process.cwd(), rung1), rootDir: newRoot };
-  // Rung 2 — transitional (same dir, old filename)
-  const rung2 = join(newRoot, "cinatra", "agent.json");
-  if (existsSync(rung2)) return { path: rung2, relPath: relative(process.cwd(), rung2), rootDir: newRoot };
-  // Rung 3 — legacy: explicit map for renamed slugs, otherwise keep slug as-is
-  const legacySlug = LEGACY_SLUG_MAP[packageSlug] ?? packageSlug;
-  const legacyRoot = join(root, legacySlug);
-  const rung3 = join(legacyRoot, "cinatra", "agent.json");
-  if (existsSync(rung3)) return { path: rung3, relPath: relative(process.cwd(), rung3), rootDir: legacyRoot };
-  // Rung 4 — legacy (older layout)
-  const rung4 = join(legacyRoot, "agent.json");
-  if (existsSync(rung4)) return { path: rung4, relPath: relative(process.cwd(), rung4), rootDir: legacyRoot };
-  return null;
-}
-
-// Resolves the on-disk directory that contains the agent (for sibling reads
-// like package.json, skills/). Delegates to resolveAgentJsonPathForRead so
-// the two resolvers can never disagree about which package a slug maps to.
-function resolveAgentRootDirForRead(packageSlug: string): string | null {
-  return resolveAgentJsonPathForRead(packageSlug)?.rootDir ?? null;
-}
-
-function resolveAgentJsonPathForWrite(packageSlug: string): {
-  dir: string;
-  path: string;
-  relPath: string;
-} {
-  // For writes: prefer the new canonical layout. If a legacy flat
-  // <installDir>/<legacySlug>/agent.json exists, overwrite in
-  // place to avoid creating a divergent second copy; otherwise write to the
-  // new canonical path under cinatra/<slug>/cinatra/oas.json.
-  const root = resolveAgentInstallDir();
-  const legacySlug = LEGACY_SLUG_MAP[packageSlug] ?? packageSlug;
-  const legacyFlat = join(root, legacySlug, "agent.json");
-  if (existsSync(legacyFlat)) {
-    return {
-      dir: join(root, legacySlug),
-      path: legacyFlat,
-      relPath: relative(process.cwd(), legacyFlat),
-    };
-  }
-  const canonicalDir = join(root, "cinatra-ai", packageSlug, "cinatra");
-  const canonicalPath = join(canonicalDir, "oas.json");
-  return {
-    dir: canonicalDir,
-    path: canonicalPath,
-    relPath: relative(process.cwd(), canonicalPath),
-  };
-}
 
 // ---------------------------------------------------------------------------
 // agent_source_list
@@ -2673,15 +2614,17 @@ function resolveAgentJsonPathForWrite(packageSlug: string): {
 async function handleAgentBuilderGitList(
   _request: PrimitiveRequest,
 ): Promise<unknown> {
-  // agents now live under <installDir>/cinatra/<slug>-agent/. Walk
-  // that vendor-namespace dir first; fall back to legacy <installDir>/<slug>/
-  // for older installs.
+  // agents now live under <installDir>/<vendor>/<slug>/. Walk the operator's
+  // OWN vendor dir AND the first-party "cinatra-ai" dir (cinatra#537), then
+  // fall back to legacy <installDir>/<slug>/ for older installs.
   const root = resolveAgentInstallDir();
   const slugSet = new Set<string>();
 
-  // New layout: <installDir>/cinatra/<slug>-agent/
-  const vendorDir = join(root, "cinatra-ai");
-  if (existsSync(vendorDir)) {
+  // New layout: <installDir>/<vendor>/<slug>/ — probe both the instance vendor
+  // segment and the first-party segment (deduped, filesystem-safe only).
+  for (const vendorSegment of safeVendorSegmentsForRead()) {
+    const vendorDir = join(root, vendorSegment);
+    if (!existsSync(vendorDir)) continue;
     try {
       const subEntries = (await readdir(vendorDir, { withFileTypes: true })) as unknown as Array<{
         name: string;
@@ -2733,8 +2676,11 @@ async function handleAgentBuilderGitList(
       let siblingPkgName: string | null = null;
       let siblingPkgVersion: string | null = null;
       const candidatePkgPaths = [
-        // New layout sibling: <installDir>/cinatra/<slug>/package.json
-        join(root, "cinatra-ai", slug, "package.json"),
+        // New layout sibling: resolve against the SAME root dir the OAS
+        // resolver picked, so the sibling read tracks the actual vendor
+        // segment (instance vendor or first-party) instead of a hardcoded
+        // "cinatra-ai" (cinatra#537).
+        join(resolved.rootDir, "package.json"),
         // Legacy layout sibling: <installDir>/<legacySlug>/package.json
         join(
           root,
@@ -3159,12 +3105,11 @@ async function handleAgentBuilderGitWriteFiles(
   // Keep the sibling-credential scan here; scope normalization is handled by
   // the canonical rescoping logic and the simpler `installRoot/agentRoot`
   // path below.
-  const identity = readInstanceIdentity();
-  const vendorName = identity
-    ? ((identity as { vendorName?: string; instanceNamespace?: string }).vendorName ??
-       (identity as { vendorName?: string; instanceNamespace?: string }).instanceNamespace ??
-       "cinatra-ai")
-    : "cinatra-ai";
+  //
+  // The vendor segment for package.json#name, the on-disk dir, and the oas.json
+  // resolver ALL derive from `resolveInstanceVendorSegment()` (cinatra#537) so
+  // they can never drift into three different identities for one agent.
+  const vendorName = resolveInstanceVendorSegment();
   const normalizedPackageName = `@${vendorName}/${packageSlug}`;
   // fail loudly at authoring time if the chat/LLM tried to
   // name an agent with a reserved workspace package slug (only bites the
@@ -3228,7 +3173,11 @@ async function handleAgentBuilderGitWriteFiles(
 );
 
   // canonical layout <installDir>/<vendor>/<slug>/ — reuse derived `vendorName` so dir, package.json#name, and published scope can't drift (cinatra#537).
+  // Defense-in-depth: assert BOTH joined segments are single safe path segments
+  // before the join (vendorName is identity-derived; packageSlug was checked for
+  // separators above — this also rejects `~`/control/drive-like forms).
   const installRoot = resolveAgentInstallDir();
+  assertSafePathSegment(packageSlug, "packageSlug");
   const agentRoot = join(installRoot, vendorName, packageSlug);
   const packageJsonPath = join(agentRoot, "package.json");
   const skillMdPath = join(agentRoot, "skills", packageSlug, "SKILL.md");
@@ -4566,9 +4515,13 @@ export async function handleAgentRunTriggerDelete(
 
 function resolveWorkflowBpmnPathForRead(packageSlug: string): { path: string; rootDir: string } | null {
   const root = resolveAgentInstallDir();
-  const pkgRoot = join(root, "cinatra-ai", packageSlug);
-  const bpmn = join(pkgRoot, "cinatra", "workflow.bpmn");
-  if (existsSync(bpmn)) return { path: bpmn, rootDir: pkgRoot };
+  // Fail-closed slug guard + filesystem-safe vendor candidates (cinatra#537).
+  if (!isSafePathSegment(packageSlug)) return null;
+  for (const vendor of safeVendorSegmentsForRead()) {
+    const pkgRoot = join(root, vendor, packageSlug);
+    const bpmn = join(pkgRoot, "cinatra", "workflow.bpmn");
+    if (existsSync(bpmn)) return { path: bpmn, rootDir: pkgRoot };
+  }
   return null;
 }
 
@@ -4736,13 +4689,9 @@ async function handleWorkflowSourceWrite(
   }
 
   // Rescope package.json#name to the operator's vendor namespace (same logic as
-  // the agent path) so disk slug, package name, and published scope cannot drift.
-  const identity = readInstanceIdentity();
-  const vendorName = identity
-    ? ((identity as { vendorName?: string; instanceNamespace?: string }).vendorName ??
-       (identity as { vendorName?: string; instanceNamespace?: string }).instanceNamespace ??
-       "cinatra-ai")
-    : "cinatra-ai";
+  // the agent path) so disk slug, package name, and published scope cannot drift
+  // (cinatra#537 — single canonical vendor segment).
+  const vendorName = resolveInstanceVendorSegment();
   const normalizedPackageName = `@${vendorName}/${packageSlug}`;
   assertNotReservedAgentPackageName(normalizedPackageName);
   const incomingName = typeof parsedPackageJson.name === "string" ? parsedPackageJson.name : null;
@@ -4765,7 +4714,11 @@ async function handleWorkflowSourceWrite(
   await emitWritingFilesIfThreaded(request.input.progressContext, request.actor, packageSlug);
 
   const installRoot = resolveAgentInstallDir();
-  const pkgRoot = join(installRoot, "cinatra-ai", packageSlug);
+  // Write under the operator's OWN vendor segment, not hardcoded cinatra-ai
+  // (cinatra#537): disk dir === package.json#name vendor. Defense-in-depth:
+  // assert packageSlug is a single safe segment before the join.
+  assertSafePathSegment(packageSlug, "packageSlug");
+  const pkgRoot = join(installRoot, vendorName, packageSlug);
   const packageJsonPath = join(pkgRoot, "package.json");
   const bpmnPath = join(pkgRoot, "cinatra", "workflow.bpmn");
   const skillMdPath = join(pkgRoot, "skills", packageSlug, "SKILL.md");
@@ -5020,9 +4973,13 @@ async function handleWorkflowSourcePublish(
 
 function resolveArtifactPackagePathForRead(packageSlug: string): { path: string; rootDir: string } | null {
   const root = resolveAgentInstallDir();
-  const pkgRoot = join(root, "cinatra-ai", packageSlug);
-  const pkgJson = join(pkgRoot, "package.json");
-  if (existsSync(pkgJson)) return { path: pkgJson, rootDir: pkgRoot };
+  // Fail-closed slug guard + filesystem-safe vendor candidates (cinatra#537).
+  if (!isSafePathSegment(packageSlug)) return null;
+  for (const vendor of safeVendorSegmentsForRead()) {
+    const pkgRoot = join(root, vendor, packageSlug);
+    const pkgJson = join(pkgRoot, "package.json");
+    if (existsSync(pkgJson)) return { path: pkgJson, rootDir: pkgRoot };
+  }
   return null;
 }
 
@@ -5175,13 +5132,9 @@ async function handleArtifactSourceWrite(
   }
 
   // Rescope package.json#name to the operator's vendor namespace (same logic as
-  // the agent/workflow path) so disk slug, package name, and published scope cannot drift.
-  const identity = readInstanceIdentity();
-  const vendorName = identity
-    ? ((identity as { vendorName?: string; instanceNamespace?: string }).vendorName ??
-       (identity as { vendorName?: string; instanceNamespace?: string }).instanceNamespace ??
-       "cinatra-ai")
-    : "cinatra-ai";
+  // the agent/workflow path) so disk slug, package name, and published scope
+  // cannot drift (cinatra#537 — single canonical vendor segment).
+  const vendorName = resolveInstanceVendorSegment();
   const normalizedPackageName = `@${vendorName}/${packageSlug}`;
   assertNotReservedAgentPackageName(normalizedPackageName);
   const incomingName = typeof parsedPackageJson.name === "string" ? parsedPackageJson.name : null;
@@ -5203,7 +5156,11 @@ async function handleArtifactSourceWrite(
   await emitWritingFilesIfThreaded(request.input.progressContext, request.actor, packageSlug);
 
   const installRoot = resolveAgentInstallDir();
-  const pkgRoot = join(installRoot, "cinatra-ai", packageSlug);
+  // Write under the operator's OWN vendor segment, not hardcoded cinatra-ai
+  // (cinatra#537): disk dir === package.json#name vendor. Defense-in-depth:
+  // assert packageSlug is a single safe segment before the join.
+  assertSafePathSegment(packageSlug, "packageSlug");
+  const pkgRoot = join(installRoot, vendorName, packageSlug);
   const packageJsonPath = join(pkgRoot, "package.json");
   const skillMdPath = join(pkgRoot, "skills", packageSlug, "SKILL.md");
 
@@ -5340,9 +5297,13 @@ async function handleArtifactSourcePublish(
 
 function resolveSkillPackagePathForRead(packageSlug: string): { path: string; rootDir: string } | null {
   const root = resolveAgentInstallDir();
-  const pkgRoot = join(root, "cinatra-ai", packageSlug);
-  const pkgJson = join(pkgRoot, "package.json");
-  if (existsSync(pkgJson)) return { path: pkgJson, rootDir: pkgRoot };
+  // Fail-closed slug guard + filesystem-safe vendor candidates (cinatra#537).
+  if (!isSafePathSegment(packageSlug)) return null;
+  for (const vendor of safeVendorSegmentsForRead()) {
+    const pkgRoot = join(root, vendor, packageSlug);
+    const pkgJson = join(pkgRoot, "package.json");
+    if (existsSync(pkgJson)) return { path: pkgJson, rootDir: pkgRoot };
+  }
   return null;
 }
 
@@ -5507,13 +5468,9 @@ async function handleSkillSourceWrite(
     }
   }
 
-  // Rescope package.json#name to the operator's vendor namespace.
-  const identity = readInstanceIdentity();
-  const vendorName = identity
-    ? ((identity as { vendorName?: string; instanceNamespace?: string }).vendorName ??
-       (identity as { vendorName?: string; instanceNamespace?: string }).instanceNamespace ??
-       "cinatra-ai")
-    : "cinatra-ai";
+  // Rescope package.json#name to the operator's vendor namespace
+  // (cinatra#537 — single canonical vendor segment).
+  const vendorName = resolveInstanceVendorSegment();
   const normalizedPackageName = `@${vendorName}/${packageSlug}`;
   assertNotReservedAgentPackageName(normalizedPackageName);
   const incomingName = typeof parsedPackageJson.name === "string" ? parsedPackageJson.name : null;
@@ -5557,7 +5514,12 @@ async function handleSkillSourceWrite(
   await emitWritingFilesIfThreaded(request.input.progressContext, request.actor, packageSlug);
 
   const installRoot = resolveAgentInstallDir();
-  const pkgRoot = join(installRoot, "cinatra-ai", packageSlug);
+  // Write under the operator's OWN vendor segment, not hardcoded cinatra-ai
+  // (cinatra#537): disk dir === package.json#name vendor. Defense-in-depth:
+  // assert BOTH joined slugs are single safe segments before the join.
+  assertSafePathSegment(packageSlug, "packageSlug");
+  assertSafePathSegment(skillSlug, "skillSlug");
+  const pkgRoot = join(installRoot, vendorName, packageSlug);
   const packageJsonPath = join(pkgRoot, "package.json");
   const skillMdPath = join(pkgRoot, "skills", skillSlug, "SKILL.md");
 
@@ -6010,6 +5972,11 @@ export {
   handleAgentBuilderGitWrite as __handleAgentBuilderGitWrite,
   handleAgentBuilderGitWriteFiles as __handleAgentBuilderGitWriteFiles,
   handleAgentBuilderGitCompileAndWrite as __handleAgentBuilderGitCompileAndWrite,
+  // cinatra#537 test seams: the single vendor-segment derivation + the on-disk
+  // path resolvers, so a test can assert the agent-create writers agree.
+  resolveInstanceVendorSegment as __resolveInstanceVendorSegment,
+  resolveAgentJsonPathForWrite as __resolveAgentJsonPathForWrite,
+  resolveAgentJsonPathForRead as __resolveAgentJsonPathForRead,
 };
 
 // ---------------------------------------------------------------------------
