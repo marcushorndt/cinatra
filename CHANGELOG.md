@@ -6,6 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-06-30
+
+This release makes installed extensions fully hot-installable on a running instance and resolves them at runtime instead of from build-time static maps, alongside connector UX and developer-experience fixes.
+
+### Changed
+
+- **Installed extensions are now the runtime source of truth.** Connector cards, setup pages, and the discovery surfaces for agents, skills, artifacts, dashboards, cubes, and portlets resolve from the live installed-extension state, so install, disable, and uninstall take effect without a rebuild or restart.
+- **Connectors toolbar.** The Connectors toolbar gains an add-connector button and clearer connected and disconnected state icons, and webhooks management moves into Configuration.
+
+### Fixed
+
+- **Artifact extension teardown.** The production artifact bridge now rescans and tears down artifact extensions correctly, so removing an artifact extension fully unregisters it.
+- **Actionable marketplace errors.** Marketplace install and update failures now show the actual, actionable error instead of a misleading generic toast.
+- **Developer experience.** A fresh `make setup` no longer exits non-zero before the wizard, and the Docker Hub mirror job no longer races the image build.
+
 ## [0.1.4] - 2026-06-28
 
 A coordinated security-hardening release, a cleaner and more consistent UI built on the design system, and a tighter connectors and agents experience.
