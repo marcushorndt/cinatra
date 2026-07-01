@@ -161,26 +161,44 @@ export async function deriveContextRouteContext(
       "parent run has no org/runBy — refusing unscoped context resolution",
     );
   }
-  // 3. Forged-body defense: resolve the TRUSTED package name from the run's
-  //    template (AgentRunRecord carries no packageName). The caller-supplied
-  //    parentPackageName MUST match; a missing trusted name fails closed (the
-  //    package selects the trusted OAS slot + accepted-extension set).
+  // 3. Forged-body defense: derive the ALLOW-SET of trusted package names from
+  //    the run's TEMPLATE (server-side; AgentRunRecord carries no packageName),
+  //    then require the caller-supplied parentPackageName to be a member. A
+  //    missing run package fails closed. The chosen package selects the trusted
+  //    OAS slot + accepted-extension set downstream.
   const template = await readAgentTemplateById(run.templateId);
-  const trustedPackageName = template?.packageName ?? null;
-  if (!trustedPackageName) {
+  const runPackageName = template?.packageName ?? null;
+  if (!runPackageName) {
     throw new ContextRouteError(
       403,
       "package_unresolved",
       `run template '${run.templateId}' has no package name — cannot trust a slot source`,
     );
   }
-  if (body.parentPackageName !== trustedPackageName) {
+  // #822: an orchestrator run resolves context slots that belong to a CHILD
+  // agent it composes; that child calls context-resolve with its OWN package
+  // (the slot's owner), not the run package. Accept parentPackageName when it is
+  // the run package OR a package the run's template legitimately declares in
+  // agentDependencies (its composed children), then trust THAT package as the
+  // slot source. The allow-set is derived server-side from the run template, so
+  // the forged-body defense holds — an arbitrary/undeclared package is still
+  // rejected. Exact membership only: no wildcard/substring/scope-prefix/semver.
+  // NOTE: this trusts any DECLARED dependency, not proof of the exact executing
+  // child node; tightening to the compiled childAgent packageName is a follow-up
+  // (compiled templates do not reliably carry childAgent.packageName yet).
+  const declaredDeps = new Set(Object.keys(template?.agentDependencies ?? {}));
+  if (
+    body.parentPackageName !== runPackageName &&
+    !declaredDeps.has(body.parentPackageName)
+  ) {
     throw new ContextRouteError(
       403,
       "package_mismatch",
-      `parentPackageName '${body.parentPackageName}' does not match run package '${trustedPackageName}'`,
+      `parentPackageName '${body.parentPackageName}' is neither the run package '${runPackageName}' nor a declared agent dependency`,
     );
   }
+  // Downstream slot loading MUST use this validated value, never the raw body.
+  const trustedPackageName = body.parentPackageName;
   // 4. Build the run-user actor with team + project visibility (canonical
   //    agent-run actor pattern; mirrors packages/agents mcp/handlers.ts).
   //    resolveAgentRunMcpActor returns null for a non-member/demoted run user
