@@ -417,8 +417,13 @@ export async function handleWayflowTaskState(args: HandleWayflowTaskStateArgs): 
     let wayflowXRenderer: string = SCHEMA_FIELD_FALLBACK_RENDERER_ID;
     let wayflowStepNumber: number | null = null;
     let wayflowSchema: Record<string, unknown> | null = null;
+    // #817: the HITL screens this template declares (namespaced x-renderer IDs).
+    // Used ONLY as corroborating evidence for the context-selector runtime
+    // correction below — never to override an explicitly-resolved xRenderer.
+    let templateHitlScreens: string[] = [];
     try {
       const tmpl = await readAgentTemplateById(run.templateId);
+      templateHitlScreens = tmpl?.hitlScreens ?? [];
       const policySteps = (tmpl?.approvalPolicy?.steps ?? []) as Array<{
         stepNumber?: number; requiresApproval?: boolean; hitlOwnedBy?: string; xRenderer?: string; gateCount?: number; schema?: Record<string, unknown>; inputMessageSchema?: Record<string, unknown>;
       }>;
@@ -478,6 +483,45 @@ export async function handleWayflowTaskState(args: HandleWayflowTaskStateArgs): 
         return {};
       }
     })();
+    // #817 (runtime compatibility repair — no architecture change): a context
+    // slot's child-agent gate (context-selection-agent) is compiled with
+    // requiresApproval:false + no xRenderer, because interactive-vs-autonomous
+    // is a RUNTIME decision (selectionMode). So when that gate interrupts, the
+    // policy carries no xRenderer and resolveWayflowXRenderer returns the
+    // schema-field fallback → the ContextSelectorRenderer is skipped → the
+    // gate's free text is forwarded verbatim to /api/context-finalize → 422
+    // bad_envelope, and the run fails.
+    //
+    // Correct the fallback to the context-selector renderer ONLY when ALL hold:
+    //   (a) the policy produced NO explicit renderer (still the fallback), so
+    //       every normal gate keeps its resolved renderer untouched;
+    //   (b) the active interrupt payload has the context-selector SHAPE
+    //       (slotMeta.slotId, or both candidates[] and selectedRefs[]); and
+    //   (c) this template DECLARES the context-selector HITL screen.
+    // Exact id/shape checks only — no substring match, no gate-index guess, so
+    // multi-slot / mixed-gate agents and autonomous slots (which never open the
+    // gate) stay correct. Does not touch the registry, the renderer, or the
+    // /api/context-finalize envelope contract.
+    if (wayflowXRenderer === SCHEMA_FIELD_FALLBACK_RENDERER_ID) {
+      const contextSelectorRendererId = resolveRendererIdForKind("context-selector");
+      const slotMeta = spreadFromOutput["slotMeta"];
+      const hasContextSelectorShape =
+        (!!slotMeta &&
+          typeof slotMeta === "object" &&
+          typeof (slotMeta as { slotId?: unknown }).slotId === "string") ||
+        (Array.isArray(spreadFromOutput["candidates"]) &&
+          Array.isArray(spreadFromOutput["selectedRefs"]));
+      const templateDeclaresContextSelector =
+        contextSelectorRendererId != null &&
+        templateHitlScreens.includes(contextSelectorRendererId);
+      if (
+        contextSelectorRendererId != null &&
+        hasContextSelectorShape &&
+        templateDeclaresContextSelector
+      ) {
+        wayflowXRenderer = contextSelectorRendererId;
+      }
+    }
     const enrichedValues: Record<string, unknown> = {
       ...(run.inputParams ?? {}),
       ...spreadFromOutput,
